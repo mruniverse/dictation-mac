@@ -4,6 +4,12 @@
 
 Ditar em português ou inglês no aplicativo em uso, sem abrir um editor separado. Pressionar um atalho inicia a captura; soltar encerra e insere texto pontuado. Público inicial: profissionais que escrevem em vários apps e usuários de terminal. Nome provisório; GitHub público é decisão tomada, licença e marca de distribuição não são.
 
+## Decisão atual: nuvem primeiro, offline opcional
+
+A primeira versão prioriza um serviço pago de transcrição, com chave de API do usuário. A decisão sucede os testes offline da issue #1: houve transcrição local, mas a rota ainda não comprovou qualidade e latência interativas no host disponível. Os gates offline passam a valer para promover uma rota offline, não para iniciar o app. Provedor inicial candidato: API oficial de transcrição da OpenAI; escolher o modelo após conferir catálogo vigente e ciclo de vida. A assinatura do ChatGPT/Codex não equivale a uma credencial de API de áudio. Codex/Claude instalados continuam candidatos à revisão textual opcional, não dependências do MVP.
+
+Primeira fatia implementável: app de barra de menus com campo de prévia, captura por acionamento dentro do app e contrato de transcrição injetável; CI usa áudio/ respostas sintéticas, sem credenciais. Em seguida: adaptar provedor oficial, guardar chave no Keychain, obter consentimento explícito para envio de áudio, provar uma chamada paga com fixture sintética e só depois comparar fala real autorizada. Timeout/cancelamento descartam resultado tardio. Acoplar atalho global e escrita segura no foco na sequência. Sem fallback silencioso, shell ou envio a provedor de gravações fornecidas para o teste local anterior. API própria gerenciada segue posterior. O quadro abaixo registra a ordem original; em caso de conflito vale esta decisão.
+
 ## Fases e critérios de saída
 
 | Fase | Entrega | Aceite / evidência |
