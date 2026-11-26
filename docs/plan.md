@@ -1,0 +1,30 @@
+# Dictation Mac — plano de produto e engenharia
+
+## Produto
+
+Ditar em português ou inglês no aplicativo em uso, sem abrir um editor separado. Pressionar um atalho inicia a captura; soltar encerra e insere texto pontuado. Público inicial: profissionais que escrevem em vários apps e usuários de terminal. Nome provisório; GitHub público é decisão tomada, licença e marca de distribuição não são.
+
+## Fases e critérios de saída
+
+| Fase | Entrega | Aceite / evidência |
+|---|---|---|
+| 0 — viabilidade | Swift/AppKit, testes macOS, prova com áudio de arquivo e transcrição no dispositivo | Build no Mac atual; teste em pt-BR com engine real e sem credenciais ou rede como fallback; registrar compatibilidade Intel/Apple Silicon separadamente |
+| 1 — ditado | Menu bar, onboarding de permissões, captura de microfone, push-to-talk, pontuação e entrega no destino | Demonstração real em TextEdit, Terminal e editor/navegador; casos de pergunta, afirmação, exclamação, acentos e troca de foco; zero execução automática |
+| 2 — escolha de modelos | Seletores separados para transcrição e revisão de texto; modelos locais e BYOK | Exibir idioma, capacidade e destino dos dados; chave no Keychain; teste de credencial iniciado pelo usuário; falha sem redirecionamento silencioso |
+| 3 — CLI instalada | Avaliar Codex e Claude Code como revisores opcionais de texto | Viabilidade técnica e termos/documentação oficiais validados por fornecedor; opt-in; escopo isolado, sem ferramentas ou execução de comandos; não ler tokens da sessão, não fazer login pelo usuário; se o isolamento não puder ser garantido, não disponibilizar |
+| 4 — serviço gerenciado | Conta e API própria com catálogo, quotas e cobrança | Limites e isolamento por conta, consentimento, orçamento, política de retenção, exclusão e operação do serviço aprovados antes do lançamento |
+| 5 — distribuição | Beta instalável, depois release assinada e notarizada | Teste em máquina limpa, verificação de arquitetura, atualização e rollback; README/demonstração em inglês para portfólio; preço a validar |
+
+Codex/Claude instalados são clientes locais, não modelos offline: podem enviar texto ao fornecedor. Não presumir que assinatura de chat cobre API ou transcrição, nem habilitar chamadas pagas em desenvolvimento sem autorização. Apple Speech on-device é hipótese para a primeira prova; se não suportar pt-BR nesta máquina, avaliar Whisper multilíngue compatível com Intel, com revisão de licença e medição de tamanho/tempo. Não habilitar reconhecimento remoto automaticamente. Streaming, reuniões, histórico na nuvem e mobile ficam fora do primeiro entregável.
+
+## Fluxo e fronteiras da fase 1
+
+- Atalho inicial configurável; preferir combinação sem utilizar Return. Command direito sozinho é candidato, não requisito de corte: provar lado da tecla, repetição, conflitos e recuperação ao perder eventos antes de promovê-lo. Toggle é pós-corte. Mostrar estado de captura na barra de menus.
+- `idle → recording` só após permissões e destino elegível; capturar identidade da sessão e do alvo. Repetição não inicia uma segunda captura. `recording → processing` ao soltar; iniciar um prazo máximo de processamento. Cancelamento, ausência de áudio, perda de captura ou erro voltam a idle sem inserir. Ignorar retorno atrasado ou duplicado usando ID de sessão.
+- `processing → review/insertion → idle`: revalidar processo e elemento focado; se não verificável ou se o foco mudou, apresentar prévia para cópia explícita. Terminal: apenas prévia quando houver caracteres de controle, quebras de linha, modo de entrada ambíguo ou confirmação de alvo indisponível. Não pressionar Return, executar shell, ou confiar que todo terminal protege colagem. Preferir escrita AX quando suportada; se houver fallback de clipboard, validar alvo antes, não sobrescrever alterações concorrentes nem prometer restauração sem teste; se inseguro, apenas cópia explícita. Campos protegidos: sem inserção automática.
+- Microfone, reconhecimento e Accessibility: pedir em contexto, explicar por que e tratar negativa/revogação sem travar. Não mudar preferências do sistema e não desligar Dictation nativo. Áudio e texto sem persistência por padrão; temporários em disco apenas quando necessários, isolados e apagados ao encerrar; logs sem conteúdo, segredos ou nomes de janelas. Nenhum provedor extra habilitado por fallback.
+- Pontuação automática no motor quando suportada; preservar intenção, nomes, números e comandos. Revisão por LLM é opcional, pode errar e nunca substitui a transcrição original em caso de falha. Saída de provedor é dado, não instrução. Mudanças semânticas entram na matriz de avaliação, não são “melhoria” presumida.
+
+## Primeira execução e gates
+
+Fase 0, arquivos permitidos: documentação, configuração de build/CI, `Probes/` e testes associados. Primeiro medir reconhecimento on-device de uma frase sintética pt-BR, separando capacidade reportada de reconhecimento confirmado. Sem capturar áudio pessoal, alterar permissões por automação ou fazer chamadas pagas. A fase 1 depende de revisão técnica e de produto deste plano e das provas de captura/foco; nenhum resultado de fixture equivale a ditado global. Checklist de teste manual: permitir/negar permissões, gravar/soltar/cancelar, trocar foco durante o processamento, campo de senha, Terminal sem execução, sessão sobreposta, português/inglês e queda do motor. Registrar latências de soltar até inserir por rota e máquina antes de publicar metas. Portfólio: PRs pequenos, ADRs para escolhas de privacidade, resultados comparáveis, vídeo real de uso e instruções reproduzíveis em inglês. GitHub Issues acompanha fases e evidências; sem segredos ou áudios privados no GitHub. Repo público não constitui licença de redistribuição.
