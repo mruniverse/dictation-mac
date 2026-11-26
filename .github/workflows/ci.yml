@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Testes da máquina de estados (fakes, sem TCC, rede ou credenciais)
+        run: swift test
+      - name: Bundle .app
+        run: scripts/build-app.sh
