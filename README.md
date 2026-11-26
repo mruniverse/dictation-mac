@@ -1,6 +1,6 @@
 # Dictation Mac
 
-A native macOS dictation app in development. Hold a shortcut, speak, release, and get punctuated text in the app you were using. The initial focus is Brazilian Portuguese and English, with on-device transcription as the first candidate and explicit controls for any cloud processing.
+A native macOS dictation app in development. Hold a shortcut, speak, release, and get punctuated text in the app you were using. The initial focus is Brazilian Portuguese and English. The MVP prioritizes cloud transcription using an explicit opt-in and the user's API key; local processing remains a separate option.
 
 **Status:** planning and feasibility. No usable app or downloadable release yet.
 
