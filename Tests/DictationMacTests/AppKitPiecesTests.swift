@@ -37,6 +37,51 @@ final class MainMenuTests: XCTestCase {
 
 @MainActor
 final class CloudDialogsTests: XCTestCase {
+    func testAPIKeyDialogReportsFullInputLengthWithoutShowingTheKey() throws {
+        _ = NSApplication.shared
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        let alert = CloudDialogs.makeAPIKeyAlert(field: field)
+        alert.layout()
+        let accessory = try XCTUnwrap(alert.accessoryView)
+        XCTAssertTrue(accessory.subviews.contains(field))
+        XCTAssertTrue(alert.window.initialFirstResponder === field)
+        let status = try XCTUnwrap(accessory.subviews.compactMap { $0 as? NSTextField }.first { $0 !== field })
+        XCTAssertEqual(status.stringValue, "Nenhuma chave inserida.")
+
+        let fixture = String(repeating: "x", count: 192)
+        field.stringValue = fixture
+        field.delegate?.controlTextDidChange?(Notification(name: NSControl.textDidChangeNotification, object: field))
+
+        XCTAssertEqual(status.stringValue, "192 caracteres inseridos. A chave está oculta.")
+        XCTAssertEqual(field.stringValue, fixture)
+        XCTAssertFalse(status.isEditable)
+
+        field.stringValue = ""
+        field.delegate?.controlTextDidChange?(Notification(name: NSControl.textDidChangeNotification, object: field))
+        XCTAssertEqual(status.stringValue, "Nenhuma chave inserida.")
+    }
+
+    func testAPIKeyCounterUpdatesFromTheAppKitSecureFieldEditor() throws {
+        _ = NSApplication.shared
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        let alert = CloudDialogs.makeAPIKeyAlert(field: field)
+        alert.layout()
+        let window = alert.window
+        XCTAssertTrue(window.makeFirstResponder(field))
+        defer { window.makeFirstResponder(nil) }
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        let status = try XCTUnwrap(alert.accessoryView?.subviews.compactMap { $0 as? NSTextField }.first { $0 !== field })
+        let fixture = String(repeating: "x", count: 192)
+
+        editor.insertText(fixture, replacementRange: editor.selectedRange())
+
+        XCTAssertEqual(status.stringValue, "192 caracteres inseridos. A chave está oculta.")
+        XCTAssertLessThanOrEqual(status.intrinsicContentSize.width, status.frame.width)
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertEqual(field.stringValue, fixture)
+        field.stringValue = ""
+    }
+
     func testConsentTextSaysTheAutomaticStopAlsoSends() {
         let text = CloudDialogs.consentText(maxDuration: CaptureLimits().maxDuration)
 

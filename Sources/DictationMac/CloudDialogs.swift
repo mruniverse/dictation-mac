@@ -10,19 +10,7 @@ enum CloudDialogs {
     /// Secure entry. Returns nil when the user cancels; an invalid key is reported without echoing it.
     static func askForAPIKey() -> OpenAIAPIKey? {
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        field.placeholderString = "Cole a chave aqui"
-        let alert = NSAlert()
-        alert.messageText = "Chave de API da OpenAI"
-        alert.informativeText = """
-            A chave fica só no Keychain deste Mac e nunca aparece no menu nem em logs.
-
-            Salvar a chave não autoriza o envio de áudio: a autorização é um passo separado, \
-            em “Autorizar envio à OpenAI…”.
-            """
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Salvar")
-        alert.addButton(withTitle: "Cancelar")
-        alert.window.initialFirstResponder = field
+        let alert = makeAPIKeyAlert(field: field)
         defer { field.stringValue = "" }
         guard runModal(alert) == .alertFirstButtonReturn else { return nil }
         guard let key = OpenAIAPIKey(field.stringValue) else {
@@ -30,6 +18,24 @@ enum CloudDialogs {
             return nil
         }
         return key
+    }
+
+    static func makeAPIKeyAlert(field: NSSecureTextField) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "Chave de API da OpenAI"
+        alert.informativeText = """
+            A chave fica oculta; os pontos visíveis não indicam o tamanho do que foi colado.
+
+            A chave fica só no Keychain deste Mac e nunca aparece no menu nem em logs.
+
+            Salvar a chave não autoriza o envio de áudio: a autorização é um passo separado, \
+            em “Autorizar envio à OpenAI…”.
+            """
+        alert.accessoryView = APIKeyEntry(field: field)
+        alert.addButton(withTitle: "Salvar")
+        alert.addButton(withTitle: "Cancelar")
+        alert.window.initialFirstResponder = field
+        return alert
     }
 
     /// Consent names the two distinct submit rules: manual stop/limit and held-key release/limit.
@@ -104,6 +110,43 @@ enum CloudDialogs {
 
 /// An alert shown without a modal loop. `runModal` started from a main-queue block keeps the main
 /// queue from draining until the user answers: the processing deadline, MainActor tasks and the
+/// withdrawal never run, and a late answer still counts. This window leaves the run loop alone;
+/// it answers once, and `close()` makes any later click a no-op.
+@MainActor
+private final class APIKeyEntry: NSView, NSTextFieldDelegate {
+    private let field: NSSecureTextField
+    private let status = NSTextField(labelWithString: "")
+
+    init(field: NSSecureTextField) {
+        self.field = field
+        super.init(frame: NSRect(x: 0, y: 0, width: field.frame.width, height: 49))
+        field.frame.origin = NSPoint(x: 0, y: 25)
+        field.placeholderString = "Cole a chave aqui"
+        field.setAccessibilityLabel("Chave de API da OpenAI")
+        field.setAccessibilityHelp("O total de caracteres inseridos aparece abaixo. A chave fica oculta.")
+        field.delegate = self
+        status.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 19)
+        addSubview(field)
+        addSubview(status)
+        updateStatus()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func controlTextDidChange(_ obj: Notification) { updateStatus() }
+
+    private func updateStatus() {
+        let count = (field.currentEditor()?.string ?? field.stringValue).count
+        status.stringValue = switch count {
+        case 0: "Nenhuma chave inserida."
+        case 1: "1 caractere inserido. A chave está oculta."
+        default: "\(count) caracteres inseridos. A chave está oculta."
+        }
+    }
+}
+
+/// A nonmodal alert: runModal from a main-queue block stalls the queue, so the deadline and
 /// withdrawal never run, and a late answer still counts. This window leaves the run loop alone;
 /// it answers once, and `close()` makes any later click a no-op.
 @MainActor
