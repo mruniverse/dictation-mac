@@ -26,6 +26,7 @@ public struct CapturedAudio: Sendable, Equatable {
 
 public enum CaptureFailure: Error, Equatable, Sendable {
     case noInputDevice
+    case selectedDeviceUnavailable
     case deviceChanged
     case engineFailure
 }
@@ -172,10 +173,11 @@ extension DiscardReason {
         case .suspended: "Sistema suspenso — áudio descartado"
         case .permissionDenied: "Microfone não autorizado — libere em Ajustes do Sistema › Privacidade e Segurança › Microfone"
         case .capture(.noInputDevice): "Nenhum microfone disponível"
+        case .capture(.selectedDeviceUnavailable): "Microfone escolhido não está conectado — escolha outro no menu Microfone"
         case .capture(.deviceChanged): "Dispositivo de áudio mudou — áudio descartado"
         case .capture(.engineFailure): "Falha na captura — áudio descartado"
         case .tooShort: "Gravação curta demais — áudio descartado"
-        case .silent: "Silêncio — áudio descartado"
+        case .silent: "Silêncio — nenhum som captado; confira o microfone no menu Microfone"
         case .transcriptionUnavailable: "Transcrição não configurada — áudio descartado"
         case .transcriptionKeychainUnavailable: "Keychain não liberou a chave de API — áudio descartado"
         case .transcriptionNotAuthorized: "Envio à OpenAI não autorizado — áudio descartado"

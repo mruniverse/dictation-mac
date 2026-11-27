@@ -160,7 +160,10 @@ final class CaptureControllerTests: XCTestCase {
         controller.stop()
 
         XCTAssertEqual(controller.lastOutcome, .discarded(.silent, duration: 2.0))
-        XCTAssertEqual(controller.lastOutcome?.message, "Silêncio — áudio descartado (2,0 s)")
+        XCTAssertEqual(
+            controller.lastOutcome?.message,
+            "Silêncio — nenhum som captado; confira o microfone no menu Microfone (2,0 s)"
+        )
     }
 
     func testFaintSignalBelowThresholdCountsAsSilence() {
@@ -322,6 +325,22 @@ final class CaptureControllerTests: XCTestCase {
         XCTAssertFalse(capture.isRunning)
         XCTAssertEqual(controller.lastOutcome, .discarded(.capture(.noInputDevice), duration: 0))
         XCTAssertEqual(controller.lastOutcome?.message, "Nenhum microfone disponível")
+    }
+
+    func testDisconnectedChosenMicrophoneEndsSessionWithoutFallingBack() {
+        let controller = makeController()
+        capture.startError = .selectedDeviceUnavailable
+
+        controller.start()
+        permission.answer(true)
+
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertFalse(capture.isRunning)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.capture(.selectedDeviceUnavailable), duration: 0))
+        XCTAssertEqual(
+            controller.lastOutcome?.message,
+            "Microfone escolhido não está conectado — escolha outro no menu Microfone"
+        )
     }
 
     // MARK: Transcriber contract (fake transcriber; the app's cloud path is in CloudTranscriptionTests)
