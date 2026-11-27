@@ -26,12 +26,14 @@ final class LiveAppKitProbeTests: XCTestCase {
         var waited: TimeInterval?
         var visibleAtDeadline = false
         var taskRan = false
+        var promptWasOpen = false
         let withdrawn = expectation(description: "deadline withdrew the question")
 
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
                 let shown = Date()
                 let handle = FirstSendPrompt.ask(duration: 2.0) { answers.append($0) }
+                promptWasOpen = FirstSendPrompt.isOpen
                 Task { @MainActor in taskRan = true }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     MainActor.assumeIsolated {
@@ -48,6 +50,8 @@ final class LiveAppKitProbeTests: XCTestCase {
         XCTAssertLessThan(waited ?? .infinity, 1.0, "the main queue kept draining while the question was open")
         XCTAssertTrue(visibleAtDeadline, "the question was on screen when the deadline fired")
         XCTAssertTrue(taskRan, "MainActor tasks (permission answer, provider result) kept running")
+        XCTAssertTrue(promptWasOpen, "the global press guard sees the open confirmation")
+        XCTAssertFalse(FirstSendPrompt.isOpen, "withdrawal clears the global press guard")
         XCTAssertFalse(Self.questionOnScreen)
         XCTAssertNil(NSApp.modalWindow)
         XCTAssertEqual(answers, [], "no answer was given, and none can come after withdrawal")

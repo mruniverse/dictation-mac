@@ -25,6 +25,8 @@ final class FakeCapture: AudioCapture {
     private(set) var starts = 0
     private(set) var isRunning = false
     var startError: CaptureFailure?
+    /// Runs inside `start`, after the device opened, like time spent opening the device.
+    var duringStart: (@MainActor () -> Void)?
     private var chunkSinks: [@Sendable @MainActor (AudioChunk) -> Void] = []
     private var onFailure: (@Sendable @MainActor (CaptureFailure) -> Void)?
 
@@ -37,6 +39,7 @@ final class FakeCapture: AudioCapture {
         isRunning = true
         chunkSinks.append(onChunk)
         self.onFailure = onFailure
+        duringStart?()
     }
 
     func stop() { isRunning = false }
@@ -106,6 +109,14 @@ final class FakeTranscriber: Transcriber {
         guard completions.indices.contains(index) else { return XCTFail("no transcription request \(index)") }
         completions[index](result)
     }
+}
+
+/// Monotonic time under test control; advancing it delivers no timer.
+@MainActor
+final class TestClock {
+    var now = ContinuousClock.now
+
+    func advance(by seconds: Double) { now = now.advanced(by: .seconds(seconds)) }
 }
 
 struct SyntheticError: Error {}

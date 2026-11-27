@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         transcriber: cloud.transcriber,
         limits: limits
     )
+    private lazy var hotKeySettings = HotKeySettings(capture: controller, scheduler: MainQueueScheduler())
 
     private var statusItem: NSStatusItem?
     private let phaseItem = AppDelegate.infoItem()
@@ -45,10 +46,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var copyItem = actionItem("Copiar transcrição", #selector(copyTranscript))
     private let keyStatusItem = AppDelegate.infoItem()
     private let consentStatusItem = AppDelegate.infoItem()
+    private let hotKeyStatusItem = AppDelegate.infoItem()
+    private lazy var toggleHotKeyItem = actionItem("Ativar atalho global…", #selector(toggleHotKey))
     private lazy var setKeyItem = actionItem("Configurar chave de API…", #selector(setAPIKey))
     private lazy var removeKeyItem = actionItem("Remover chave de API", #selector(removeAPIKey))
     private lazy var grantItem = actionItem("Autorizar envio à OpenAI…", #selector(grantConsent))
     private lazy var revokeItem = actionItem("Revogar autorização de envio", #selector(revokeConsent))
+    private lazy var hotKeyMenuItem: NSMenuItem = {
+        let item = NSMenuItem(title: "Atalho global (push-to-talk)", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        submenu.delegate = self
+        submenu.addItem(hotKeyStatusItem)
+        submenu.addItem(toggleHotKeyItem)
+        submenu.addItem(.separator())
+        hotKeyShortcutItems.forEach(submenu.addItem)
+        item.submenu = submenu
+        return item
+    }()
+    private lazy var hotKeyShortcutItems: [NSMenuItem] = PushToTalkShortcut.allCases.enumerated().map { index, shortcut in
+        let item = actionItem(shortcut.title, #selector(selectPushToTalkShortcut(_:)))
+        item.tag = index
+        return item
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let cloudMenu = NSMenu()
@@ -62,7 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.delegate = self
-        for item in [phaseItem, outcomeItem, .separator(), startItem, stopItem, cancelItem, copyItem, .separator(), cloudItem, .separator()] {
+        for item in [phaseItem, outcomeItem, .separator(), startItem, stopItem, cancelItem, copyItem, .separator(), hotKeyMenuItem, .separator(), cloudItem, .separator()] {
             menu.addItem(item)
         }
         menu.addItem(NSMenuItem(title: "Sair", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -70,12 +90,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         statusItem = item
 
-        controller.onChange = { [weak self] in self?.render() }
+        controller.onChange = { [weak self] in
+            self?.hotKeySettings.captureChanged()
+            self?.render()
+        }
         settings.onChange = { [weak self] in self?.render() }
+        hotKeySettings.onChange = { [weak self] in self?.render() }
         let workspace = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.controller.suspend() }
+                MainActor.assumeIsolated {
+                    self?.controller.suspend()
+                    self?.hotKeySettings.suspend()
+                }
             }
         }
         render()
@@ -83,11 +110,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        hotKeySettings.disable()
         controller.cancel()
     }
 
-    /// The lookup runs on the keychain queue; the menu updates when it answers.
+    /// Status values are read-only; the actual Keychain lookup runs off the main thread.
     func menuWillOpen(_ menu: NSMenu) {
+        render()
         settings.refreshKeyStatus()
     }
 
@@ -96,6 +125,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func startCapture() { controller.start() }
     @objc private func stopCapture() { controller.stop() }
     @objc private func cancelCapture() { controller.cancel() }
+
+    @objc private func toggleHotKey() {
+        if hotKeySettings.status == .active { hotKeySettings.disable() }
+        else if controller.phase == .idle { hotKeySettings.enable() }
+    }
+
+    @objc private func selectPushToTalkShortcut(_ sender: NSMenuItem) {
+        guard controller.phase == .idle, PushToTalkShortcut.allCases.indices.contains(sender.tag) else { return }
+        hotKeySettings.select(PushToTalkShortcut.allCases[sender.tag])
+    }
 
     /// Explicit copy of real provider text only; nothing is copied automatically.
     @objc private func copyTranscript() {
@@ -107,7 +146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Cloud settings
 
     @objc private func setAPIKey() {
-        guard controller.phase == .idle, let key = CloudDialogs.askForAPIKey(),
+        guard controller.phase == .idle,
+              let key = hotKeySettings.duringSettingsDialog({ CloudDialogs.askForAPIKey() }),
               controller.phase == .idle else { return }
         settings.saveKey(key) { failure in
             if let failure { CloudDialogs.notify("Chave não salva", Self.keychainFailure(failure)) }
@@ -123,7 +163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func grantConsent() {
         guard controller.phase == .idle, settings.consent.state == .notGranted,
-              CloudDialogs.askForConsent(maxDuration: limits.maxDuration),
+              hotKeySettings.duringSettingsDialog({
+                  CloudDialogs.askForConsent(maxDuration: limits.maxDuration, pttMaximumHold: hotKeySettings.maximumHold)
+              }),
               controller.phase == .idle, settings.consent.state == .notGranted else {
             return
         }
@@ -154,8 +196,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         outcomeItem.title = Self.abbreviated(controller.lastOutcome?.message ?? "")
         outcomeItem.isHidden = controller.lastOutcome == nil
         startItem.isEnabled = phase == .idle
-        stopItem.isEnabled = phase == .recording
+        stopItem.isEnabled = phase == .recording && controller.origin == .manual
         cancelItem.isEnabled = phase != .idle
+        hotKeyStatusItem.title = hotKeySettings.menuStatus
+        toggleHotKeyItem.title = hotKeySettings.status == .active ? "Desativar atalho global" : "Ativar atalho global…"
+        toggleHotKeyItem.isEnabled = phase == .idle || hotKeySettings.status == .active
+        for (index, shortcut) in PushToTalkShortcut.allCases.enumerated() {
+            hotKeyShortcutItems[index].state = hotKeySettings.shortcut == shortcut ? .on : .off
+            hotKeyShortcutItems[index].isEnabled = hotKeySettings.status != .active && phase == .idle
+        }
         if case .transcribed = controller.lastOutcome { copyItem.isEnabled = true } else { copyItem.isEnabled = false }
 
         let keyStatus = settings.keyStatus

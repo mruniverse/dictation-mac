@@ -130,6 +130,7 @@ public enum DiscardReason: Equatable, Sendable {
     case transcriptionRateLimited
     case transcriptionEmpty
     case transcriptionFailed
+    case pushToTalkExpired
 }
 
 public enum Outcome: Equatable, Sendable {
@@ -184,6 +185,7 @@ extension DiscardReason {
         case .transcriptionRateLimited: "Limite ou cota do provedor atingido — áudio descartado"
         case .transcriptionEmpty: "Nenhuma fala reconhecida — áudio descartado"
         case .transcriptionFailed: "Falha na transcrição — áudio descartado"
+        case .pushToTalkExpired: "Prazo do atalho esgotado — áudio descartado sem envio"
         }
     }
 }

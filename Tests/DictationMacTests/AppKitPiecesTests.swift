@@ -37,10 +37,80 @@ final class MainMenuTests: XCTestCase {
 
 @MainActor
 final class CloudDialogsTests: XCTestCase {
+    func testPastingALongAPIKeyFillsTheSecureFieldWhileEditing() throws {
+        _ = NSApplication.shared
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        let alert = CloudDialogs.makeAPIKeyAlert(field: field)
+        alert.layout()
+        let window = alert.window
+        window.appearance = NSAppearance(named: .aqua)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        defer { _ = window.makeFirstResponder(nil); field.stringValue = "" }
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let fixture = String(repeating: "AbCdEf0123456789", count: 12)
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString(fixture, forType: .string))
+        XCTAssertTrue(editor.readSelection(from: pasteboard))
+
+        let bitmap = try XCTUnwrap(field.bitmapImageRepForCachingDisplay(in: field.bounds))
+        field.cacheDisplay(in: field.bounds, to: bitmap)
+        let width = bitmap.pixelsWide
+        let height = bitmap.pixelsHigh
+        let darkColumnsNearRight = (width * 7 / 8..<width * 97 / 100).filter { x in
+            (height / 4..<height * 3 / 4).contains { y in
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
+                return color.alphaComponent > 0.5 && color.brightnessComponent < 0.45
+            }
+        }
+        XCTAssertGreaterThan(darkColumnsNearRight.count, width / 40, "Masked glyphs should reach the right edge even before editing ends")
+
+        XCTAssertEqual(editor.selectedRange(), NSRange(location: fixture.utf16.count, length: 0))
+        editor.deleteBackward(nil)
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertTrue(field.stringValue == String(fixture.dropLast()), "The field should keep the full paste and edit its last character")
+    }
+
+    func testCaretStaysVisibleWhenMovingAcrossALongAPIKey() throws {
+        _ = NSApplication.shared
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        let alert = CloudDialogs.makeAPIKeyAlert(field: field)
+        alert.layout()
+        let window = alert.window
+        XCTAssertTrue(window.makeFirstResponder(field))
+        defer { _ = window.makeFirstResponder(nil); field.stringValue = "" }
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        let fixture = String(repeating: "AbCdEf0123456789", count: 11)
+        editor.insertText(fixture, replacementRange: editor.selectedRange())
+
+        editor.moveToBeginningOfLine(nil)
+        XCTAssertEqual(editor.selectedRange().location, 0)
+        let start = editor.visibleRect
+        let finalOffset = fixture.utf16.count
+        for _ in 0..<finalOffset { editor.moveRight(nil) }
+        XCTAssertEqual(editor.selectedRange(), NSRange(location: finalOffset, length: 0))
+        let end = editor.visibleRect
+        XCTAssertGreaterThan(end.minX, start.minX, "The viewport should follow the caret horizontally")
+        XCTAssertEqual(end.minY, start.minY, "The caret must stay on the same visual line")
+        let caret = editor.convert(window.convertFromScreen(editor.firstRect(forCharacterRange: editor.selectedRange(), actualRange: nil)), from: nil)
+        XCTAssertGreaterThanOrEqual(caret.minX, end.minX)
+        XCTAssertLessThan(caret.minX, end.maxX)
+
+        editor.moveToBeginningOfLine(nil)
+        XCTAssertEqual(editor.selectedRange().location, 0)
+        XCTAssertEqual(editor.visibleRect.minX, start.minX)
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertTrue(field.stringValue == fixture, "Navigating must not change the key")
+    }
+
     func testConsentTextSaysTheAutomaticStopAlsoSends() {
         let text = CloudDialogs.consentText(maxDuration: CaptureLimits().maxDuration)
 
-        XCTAssertTrue(text.contains("encerrada em Parar — ou pela parada automática, ao atingir 30 s — é enviada"), text)
+        XCTAssertTrue(text.contains("uma gravação manual é enviada ao Parar ou pela parada automática"), text)
+        XCTAssertTrue(text.contains("atingir 30 s"), text)
+        XCTAssertTrue(text.contains("soltar Ctrl+Shift+letra antes de 25 s envia o clipe"), text)
+        XCTAssertTrue(text.contains("alcançar esse prazo descarta o áudio sem envio"), text)
         XCTAssertTrue(text.contains("api.openai.com"))
         XCTAssertTrue(text.contains("à parte de qualquer assinatura do ChatGPT"))
         XCTAssertTrue(
