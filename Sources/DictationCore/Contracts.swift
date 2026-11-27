@@ -16,6 +16,11 @@ public struct CapturedAudio: Sendable, Equatable {
     public let samples: [Float]
     public let sampleRate: Double
 
+    public init(samples: [Float], sampleRate: Double) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+    }
+
     public var duration: TimeInterval { Double(samples.count) / sampleRate }
 }
 
@@ -49,7 +54,54 @@ public protocol Scheduler {
 
 @MainActor
 public protocol Transcriber {
-    func transcribe(_ audio: CapturedAudio, completion: @escaping @Sendable @MainActor (Result<String, Error>) -> Void)
+    /// Starts one request and returns its cancellation handle. The caller cancels on cancel,
+    /// suspension or deadline, and still ignores any completion that arrives afterwards.
+    func transcribe(
+        _ audio: CapturedAudio,
+        completion: @escaping @Sendable @MainActor (Result<String, Error>) -> Void
+    ) -> TranscriptionCancellation
+}
+
+/// Stops an in-flight transcription. Must be idempotent; after it runs, the completion may never arrive.
+public struct TranscriptionCancellation: Sendable {
+    /// For requests that already reported: nothing left to stop.
+    public static let finished = TranscriptionCancellation {}
+
+    private let action: @Sendable @MainActor () -> Void
+
+    public init(_ action: @escaping @Sendable @MainActor () -> Void) {
+        self.action = action
+    }
+
+    @MainActor public func cancel() { action() }
+}
+
+/// Provider failures without payload: never carries response bodies, provider messages or credentials.
+public enum TranscriptionError: Error, Equatable, Sendable {
+    /// The user has not authorized sending audio to this destination; nothing was sent.
+    case consentRequired
+    /// The user declined the first-send confirmation; nothing was sent.
+    case declined
+    /// No credential configured; nothing was sent.
+    case missingCredential
+    /// The keychain refused the lookup or the read (locked, access denied, damaged item): whether
+    /// a key exists is unknown, so this is never reported as a missing key. Nothing was sent.
+    case credentialUnavailable
+    /// Invalid format or above the provider's upload limit; nothing was sent.
+    case unsupportedAudio
+    /// Credential refused or without permission (HTTP 401/403).
+    case unauthorized
+    /// Rate limit or quota reached (HTTP 429).
+    case rateLimited
+    /// Other request refusal (HTTP 4xx).
+    case rejected
+    /// Provider failure (HTTP 5xx).
+    case server
+    /// Transport failure: offline, DNS, TLS or network timeout.
+    case network
+    /// Redirect, unexpected status or malformed body.
+    case invalidResponse
+    case cancelled
 }
 
 public struct CaptureLimits: Sendable {
@@ -70,7 +122,13 @@ public enum DiscardReason: Equatable, Sendable {
     case tooShort
     case silent
     case transcriptionUnavailable
+    case transcriptionKeychainUnavailable
+    case transcriptionNotAuthorized
+    case transcriptionDeclined
     case transcriptionTimedOut
+    case transcriptionUnauthorized
+    case transcriptionRateLimited
+    case transcriptionEmpty
     case transcriptionFailed
 }
 
@@ -95,6 +153,18 @@ public enum Outcome: Equatable, Sendable {
 }
 
 extension DiscardReason {
+    init(transcriptionFailure error: Error) {
+        self = switch error as? TranscriptionError {
+        case .consentRequired: .transcriptionNotAuthorized
+        case .declined: .transcriptionDeclined
+        case .missingCredential: .transcriptionUnavailable
+        case .credentialUnavailable: .transcriptionKeychainUnavailable
+        case .unauthorized: .transcriptionUnauthorized
+        case .rateLimited: .transcriptionRateLimited
+        default: .transcriptionFailed
+        }
+    }
+
     var message: String {
         switch self {
         case .cancelled: "Cancelado — áudio descartado"
@@ -106,7 +176,13 @@ extension DiscardReason {
         case .tooShort: "Gravação curta demais — áudio descartado"
         case .silent: "Silêncio — áudio descartado"
         case .transcriptionUnavailable: "Transcrição não configurada — áudio descartado"
+        case .transcriptionKeychainUnavailable: "Keychain não liberou a chave de API — áudio descartado"
+        case .transcriptionNotAuthorized: "Envio à OpenAI não autorizado — áudio descartado"
+        case .transcriptionDeclined: "Envio recusado — áudio descartado"
         case .transcriptionTimedOut: "Transcrição excedeu o prazo — áudio descartado"
+        case .transcriptionUnauthorized: "Chave de API recusada ou sem permissão — áudio descartado"
+        case .transcriptionRateLimited: "Limite ou cota do provedor atingido — áudio descartado"
+        case .transcriptionEmpty: "Nenhuma fala reconhecida — áudio descartado"
         case .transcriptionFailed: "Falha na transcrição — áudio descartado"
         }
     }

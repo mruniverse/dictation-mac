@@ -25,6 +25,6 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>O Dictation Mac usa o microfone só enquanto você grava pelo menu. O áudio fica na memória e é descartado ao fim da sessão.</string>
+	<string>O Dictation Mac usa o microfone só enquanto você grava pelo menu. O áudio fica na memória e é descartado ao fim da sessão; só é enviado à OpenAI para transcrição se você autorizar esse envio no menu.</string>
 </dict>
 </plist>

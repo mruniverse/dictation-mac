@@ -24,6 +24,8 @@ public final class CaptureController {
     private var samples: [Float] = []
     private var sampleRate: Double?
     private var loudestRMS: Float = 0
+    /// Request of the current session; cancelled whenever the session ends without its result.
+    private var inFlight: TranscriptionCancellation?
     private var duration: TimeInterval { sampleRate.map { Double(samples.count) / $0 } ?? 0 }
 
     public init(
@@ -46,6 +48,8 @@ public final class CaptureController {
         sessionID = id
         lastOutcome = nil
         transition(to: .awaitingPermission)
+        // The observer may have ended the session; a cancelled session must not show the system prompt.
+        guard isCurrent(id, .awaitingPermission) else { return }
         permission.requestAccess { [weak self] granted in self?.permissionAnswered(granted, session: id) }
     }
 
@@ -58,18 +62,36 @@ public final class CaptureController {
         guard let transcriber, let sampleRate, let id = sessionID else {
             return end(.discarded(.transcriptionUnavailable, duration: measured))
         }
+        let audio = CapturedAudio(samples: samples, sampleRate: sampleRate)
         transition(to: .processing)
+        // The observer may cancel, suspend or even start the next session from inside the notification.
+        guard isCurrent(id, .processing) else { return }
         scheduler.schedule(after: limits.processingTimeout) { [weak self] in
             guard let self, self.isCurrent(id, .processing) else { return }
             self.end(.discarded(.transcriptionTimedOut, duration: measured))
         }
-        transcriber.transcribe(CapturedAudio(samples: samples, sampleRate: sampleRate)) { [weak self] result in
+        // A scheduler may run an already-due deadline synchronously.
+        guard isCurrent(id, .processing) else { return }
+        let request = PendingRequest()
+        let handle = transcriber.transcribe(audio) { [weak self] result in
+            request.answered = true
             guard let self, self.isCurrent(id, .processing) else { return }
+            self.inFlight = nil
             switch result {
+            case let .success(text) where text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                self.end(.discarded(.transcriptionEmpty, duration: measured))
             case let .success(text): self.end(.transcribed(text, duration: measured))
-            case .failure: self.end(.discarded(.transcriptionFailed, duration: measured))
+            case let .failure(error):
+                self.end(.discarded(DiscardReason(transcriptionFailure: error), duration: measured))
             }
         }
+        if isCurrent(id, .processing) {
+            inFlight = handle
+        } else if !request.answered {
+            // The session ended inside `transcribe` without this request's result: nothing else owns it.
+            handle.cancel()
+        }
+        // Otherwise it answered synchronously and is finished; a later session must never cancel it.
     }
 
     public func cancel() { abort(.cancelled) }
@@ -119,6 +141,10 @@ public final class CaptureController {
         sampleRate = nil
         loudestRMS = 0
         sessionID = nil
+        // Cancelled only after the session is invalidated, so a synchronous answer is filtered out.
+        let pending = inFlight
+        inFlight = nil
+        pending?.cancel()
         lastOutcome = outcome
         transition(to: .idle)
     }
@@ -131,4 +157,10 @@ public final class CaptureController {
         phase = next
         onChange?()
     }
+}
+
+/// Whether a request already reported, even to a session that had ended.
+@MainActor
+private final class PendingRequest {
+    var answered = false
 }
