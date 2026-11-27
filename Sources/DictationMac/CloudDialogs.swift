@@ -21,17 +21,21 @@ enum CloudDialogs {
     }
 
     static func makeAPIKeyAlert(field: NSSecureTextField) -> NSAlert {
+        field.placeholderString = "Cole a chave aqui"
+        field.setAccessibilityLabel("Chave de API da OpenAI")
+        // Keep the masked line clipped to the field instead of scrolling its tail into view.
+        field.cell?.wraps = false
+        field.cell?.isScrollable = false
+        field.cell?.lineBreakMode = .byClipping
         let alert = NSAlert()
         alert.messageText = "Chave de API da OpenAI"
         alert.informativeText = """
-            A chave fica oculta; os pontos visíveis não indicam o tamanho do que foi colado.
-
             A chave fica só no Keychain deste Mac e nunca aparece no menu nem em logs.
 
             Salvar a chave não autoriza o envio de áudio: a autorização é um passo separado, \
             em “Autorizar envio à OpenAI…”.
             """
-        alert.accessoryView = APIKeyEntry(field: field)
+        alert.accessoryView = field
         alert.addButton(withTitle: "Salvar")
         alert.addButton(withTitle: "Cancelar")
         alert.window.initialFirstResponder = field
@@ -105,44 +109,6 @@ enum CloudDialogs {
     private static func runModal(_ alert: NSAlert) -> NSApplication.ModalResponse {
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal()
-    }
-}
-
-/// An alert shown without a modal loop. `runModal` started from a main-queue block keeps the main
-/// queue from draining until the user answers: the processing deadline, MainActor tasks and the
-/// withdrawal never run, and a late answer still counts. This window leaves the run loop alone;
-/// it answers once, and `close()` makes any later click a no-op.
-@MainActor
-private final class APIKeyEntry: NSView, NSTextFieldDelegate {
-    private let field: NSSecureTextField
-    private let status = NSTextField(labelWithString: "")
-
-    init(field: NSSecureTextField) {
-        self.field = field
-        super.init(frame: NSRect(x: 0, y: 0, width: field.frame.width, height: 49))
-        field.frame.origin = NSPoint(x: 0, y: 25)
-        field.placeholderString = "Cole a chave aqui"
-        field.setAccessibilityLabel("Chave de API da OpenAI")
-        field.setAccessibilityHelp("O total de caracteres inseridos aparece abaixo. A chave fica oculta.")
-        field.delegate = self
-        status.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 19)
-        addSubview(field)
-        addSubview(status)
-        updateStatus()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    func controlTextDidChange(_ obj: Notification) { updateStatus() }
-
-    private func updateStatus() {
-        let count = (field.currentEditor()?.string ?? field.stringValue).count
-        status.stringValue = switch count {
-        case 0: "Nenhuma chave inserida."
-        case 1: "1 caractere inserido. A chave está oculta."
-        default: "\(count) caracteres inseridos. A chave está oculta."
-        }
     }
 }
 

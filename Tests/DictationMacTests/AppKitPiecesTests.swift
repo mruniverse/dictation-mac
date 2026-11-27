@@ -37,49 +37,39 @@ final class MainMenuTests: XCTestCase {
 
 @MainActor
 final class CloudDialogsTests: XCTestCase {
-    func testAPIKeyDialogReportsFullInputLengthWithoutShowingTheKey() throws {
-        _ = NSApplication.shared
-        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        let alert = CloudDialogs.makeAPIKeyAlert(field: field)
-        alert.layout()
-        let accessory = try XCTUnwrap(alert.accessoryView)
-        XCTAssertTrue(accessory.subviews.contains(field))
-        XCTAssertTrue(alert.window.initialFirstResponder === field)
-        let status = try XCTUnwrap(accessory.subviews.compactMap { $0 as? NSTextField }.first { $0 !== field })
-        XCTAssertEqual(status.stringValue, "Nenhuma chave inserida.")
-
-        let fixture = String(repeating: "x", count: 192)
-        field.stringValue = fixture
-        field.delegate?.controlTextDidChange?(Notification(name: NSControl.textDidChangeNotification, object: field))
-
-        XCTAssertEqual(status.stringValue, "192 caracteres inseridos. A chave está oculta.")
-        XCTAssertEqual(field.stringValue, fixture)
-        XCTAssertFalse(status.isEditable)
-
-        field.stringValue = ""
-        field.delegate?.controlTextDidChange?(Notification(name: NSControl.textDidChangeNotification, object: field))
-        XCTAssertEqual(status.stringValue, "Nenhuma chave inserida.")
-    }
-
-    func testAPIKeyCounterUpdatesFromTheAppKitSecureFieldEditor() throws {
+    func testPastingALongAPIKeyFillsTheSecureFieldWhileEditing() throws {
         _ = NSApplication.shared
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         let alert = CloudDialogs.makeAPIKeyAlert(field: field)
         alert.layout()
         let window = alert.window
+        window.appearance = NSAppearance(named: .aqua)
         XCTAssertTrue(window.makeFirstResponder(field))
-        defer { window.makeFirstResponder(nil) }
+        defer { _ = window.makeFirstResponder(nil); field.stringValue = "" }
         let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
-        let status = try XCTUnwrap(alert.accessoryView?.subviews.compactMap { $0 as? NSTextField }.first { $0 !== field })
-        let fixture = String(repeating: "x", count: 192)
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let fixture = String(repeating: "AbCdEf0123456789", count: 12)
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString(fixture, forType: .string))
+        XCTAssertTrue(editor.readSelection(from: pasteboard))
 
-        editor.insertText(fixture, replacementRange: editor.selectedRange())
+        let bitmap = try XCTUnwrap(field.bitmapImageRepForCachingDisplay(in: field.bounds))
+        field.cacheDisplay(in: field.bounds, to: bitmap)
+        let width = bitmap.pixelsWide
+        let height = bitmap.pixelsHigh
+        let darkColumnsNearRight = (width * 7 / 8..<width * 97 / 100).filter { x in
+            (height / 4..<height * 3 / 4).contains { y in
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
+                return color.alphaComponent > 0.5 && color.brightnessComponent < 0.45
+            }
+        }
+        XCTAssertGreaterThan(darkColumnsNearRight.count, width / 40, "Masked glyphs should reach the right edge even before editing ends")
 
-        XCTAssertEqual(status.stringValue, "192 caracteres inseridos. A chave está oculta.")
-        XCTAssertLessThanOrEqual(status.intrinsicContentSize.width, status.frame.width)
+        XCTAssertEqual(editor.selectedRange(), NSRange(location: fixture.utf16.count, length: 0))
+        editor.deleteBackward(nil)
         XCTAssertTrue(window.makeFirstResponder(nil))
-        XCTAssertEqual(field.stringValue, fixture)
-        field.stringValue = ""
+        XCTAssertTrue(field.stringValue == String(fixture.dropLast()), "The field should keep the full paste and edit its last character")
     }
 
     func testConsentTextSaysTheAutomaticStopAlsoSends() {
