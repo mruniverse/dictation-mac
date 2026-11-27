@@ -32,12 +32,13 @@ enum CloudDialogs {
         return key
     }
 
-    /// Every way a recording ends with audio — Parar or the automatic stop — leads to an upload.
-    static func consentText(maxDuration: TimeInterval) -> String {
+    /// Consent names the two distinct submit rules: manual stop/limit and held-key release/limit.
+    static func consentText(maxDuration: TimeInterval, pttMaximumHold: TimeInterval = 25) -> String {
         """
-        Com a autorização, cada gravação encerrada em Parar — ou pela parada automática, ao \
-        atingir \(Int(maxDuration)) s — é enviada para transcrição à \(destinationText), com a \
-        sua chave de API.
+        Com a autorização, uma gravação manual é enviada ao Parar ou pela parada automática ao \
+        atingir \(Int(maxDuration)) s. Com o push-to-talk ativado, soltar Ctrl+Shift+letra antes \
+        de \(Int(pttMaximumHold)) s envia o clipe; alcançar esse prazo descarta o áudio sem envio.
+        \(destinationText), com a sua chave de API.
 
         Custo: cobrado pela OpenAI na conta da chave de API, à parte de qualquer assinatura do \
         ChatGPT.
@@ -51,10 +52,10 @@ enum CloudDialogs {
     }
 
     /// Explicit consent, separate from the key: destination, cost and what happens to the audio.
-    static func askForConsent(maxDuration: TimeInterval) -> Bool {
+    static func askForConsent(maxDuration: TimeInterval, pttMaximumHold: TimeInterval = 25) -> Bool {
         let alert = NSAlert()
         alert.messageText = "Autorizar o envio de áudio à OpenAI?"
-        alert.informativeText = consentText(maxDuration: maxDuration)
+        alert.informativeText = consentText(maxDuration: maxDuration, pttMaximumHold: pttMaximumHold)
         alert.addButton(withTitle: "Autorizar envio")
         alert.addButton(withTitle: "Cancelar")
         return runModal(alert) == .alertFirstButtonReturn
@@ -109,6 +110,7 @@ enum CloudDialogs {
 final class FloatingAlert: NSObject {
     /// Alerts on screen, kept alive until answered or closed: buttons hold their target weakly.
     private static var shown: [FloatingAlert] = []
+    static var isOpen: Bool { shown.contains { $0.alert.window.isVisible && $0.onAnswer != nil } }
 
     let alert: NSAlert
     private var onAnswer: (@MainActor (NSApplication.ModalResponse) -> Void)?
@@ -154,6 +156,8 @@ final class FloatingAlert: NSObject {
 /// withdraws the alert (deadline, cancel, revocation, key removal) so a later click is never an answer.
 @MainActor
 enum FirstSendPrompt {
+    static var isOpen: Bool { FloatingAlert.isOpen }
+
     static func ask(
         duration: TimeInterval,
         reply: @escaping @Sendable @MainActor (Bool) -> Void

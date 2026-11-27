@@ -13,7 +13,7 @@ public protocol PushToTalkCapture: AnyObject, Sendable {
     var phase: CaptureController.Phase { get }
     var sessionID: UUID? { get }
     /// Install the proposal before returning `.accepted(proposal)`; rejection transfers no ownership.
-    func start(proposing sessionID: UUID) -> PushToTalkStart
+    func start(proposing sessionID: UUID, deadline: ContinuousClock.Instant) -> PushToTalkStart
     func stop(session sessionID: UUID)
     func cancel(session sessionID: UUID)
 }
@@ -30,6 +30,7 @@ public final class PushToTalk {
     private let scheduler: Scheduler
     private let maximumHold: TimeInterval
     private let now: @MainActor () -> ContinuousClock.Instant
+    private let blocked: @MainActor () -> Bool
     private var ownedSession: UUID?
     private var gesture: (id: UUID, deadline: ContinuousClock.Instant)?
 
@@ -38,12 +39,14 @@ public final class PushToTalk {
         capture: PushToTalkCapture,
         scheduler: Scheduler,
         maximumHold: TimeInterval = 25,
-        now: @escaping @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now }
+        now: @escaping @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now },
+        blocked: @escaping @MainActor () -> Bool = { false }
     ) {
         self.capture = capture
         self.scheduler = scheduler
         self.maximumHold = maximumHold
         self.now = now
+        self.blocked = blocked
     }
 
     deinit {
@@ -90,7 +93,7 @@ public final class PushToTalk {
             switch capture.phase {
             case .awaitingPermission: capture.cancel(session: id)
             case .recording:
-                if let deadline, now() < deadline { capture.stop(session: id) }
+                if !blocked(), let deadline, now() < deadline { capture.stop(session: id) }
                 else { capture.cancel(session: id) }
             case .idle, .processing: break
             }
@@ -99,7 +102,7 @@ public final class PushToTalk {
             isPressed = true
             let wasArmed = isArmed
             isArmed = false
-            guard wasArmed, maximumHold.isFinite, maximumHold > 0, maximumHold <= 30,
+            guard wasArmed, !blocked(), maximumHold.isFinite, maximumHold > 0, maximumHold <= 30,
                   capture.phase == .idle, capture.sessionID == nil else { return }
             let id = UUID()
             let deadline = now().advanced(by: .seconds(maximumHold))
@@ -111,7 +114,7 @@ public final class PushToTalk {
             // An injected scheduler may invalidate the gesture before returning.
             guard gesture?.id == id, self.registration == registration, isPressed else { return }
             guard now() < deadline else { return discard() }
-            guard capture.start(proposing: id) == .accepted(id), capture.sessionID == id else {
+            guard capture.start(proposing: id, deadline: deadline) == .accepted(id), capture.sessionID == id else {
                 if gesture?.id == id { gesture = nil }
                 return
             }

@@ -312,6 +312,63 @@ final class PushToTalkTests: XCTestCase {
         XCTAssertTrue(capture.proposals.isEmpty)
     }
 
+    func testPressProposesTheMonotonicDeadlineOfTheGesture() {
+        let capture = PushToTalkCaptureFake()
+        let clock = PushToTalkTestClock()
+        let subject = PushToTalk(capture: capture, scheduler: FakeScheduler(), maximumHold: 5, now: { clock.now })
+        let registration = UUID()
+        subject.activate(registration: registration)
+        subject.receive(.released, registration: registration)
+        let pressedAt = clock.now
+
+        subject.receive(.pressed, registration: registration)
+
+        XCTAssertEqual(capture.deadlines, [pressedAt.advanced(by: .seconds(5))])
+    }
+
+    func testBlockedPressStartsNothingAndTheNextPressNeedsAFreshRelease() {
+        let capture = PushToTalkCaptureFake()
+        let gate = PushToTalkBlock()
+        gate.isBlocked = true
+        let subject = PushToTalk(capture: capture, scheduler: FakeScheduler(), blocked: { gate.isBlocked })
+        let registration = UUID()
+        subject.activate(registration: registration)
+        subject.receive(.released, registration: registration)
+
+        subject.receive(.pressed, registration: registration)
+        XCTAssertTrue(capture.proposals.isEmpty)
+        XCTAssertTrue(subject.isPressed)
+        XCTAssertFalse(subject.isArmed)
+        gate.isBlocked = false
+        subject.receive(.pressed, registration: registration)
+        XCTAssertTrue(capture.proposals.isEmpty, "a repeat of the blocked press must not start")
+
+        subject.receive(.released, registration: registration)
+        XCTAssertTrue(subject.isArmed, "the release still reaches the latch")
+        subject.receive(.pressed, registration: registration)
+        XCTAssertEqual(capture.proposals.count, 1)
+    }
+
+    func testReleaseWhileBlockedDiscardsTheOwnedRecordingInsteadOfSubmitting() {
+        let capture = PushToTalkCaptureFake()
+        let gate = PushToTalkBlock()
+        let subject = PushToTalk(capture: capture, scheduler: FakeScheduler(), blocked: { gate.isBlocked })
+        let registration = UUID()
+        subject.activate(registration: registration)
+        subject.receive(.released, registration: registration)
+        subject.receive(.pressed, registration: registration)
+        let id = capture.sessionID!
+        capture.grant(session: id)
+        gate.isBlocked = true
+
+        subject.receive(.released, registration: registration)
+
+        XCTAssertEqual(capture.cancellations, [id])
+        XCTAssertTrue(capture.stops.isEmpty)
+        XCTAssertFalse(subject.isPressed)
+        XCTAssertTrue(subject.isArmed, "the release still reaches the latch")
+    }
+
     func testManualSessionAndChangedIDAreNeverStoppedOrCancelled() {
         for phase in [CaptureController.Phase.awaitingPermission, .recording, .processing] {
             let capture = PushToTalkCaptureFake()
@@ -347,6 +404,11 @@ private final class PushToTalkTestClock {
 }
 
 @MainActor
+private final class PushToTalkBlock {
+    var isBlocked = false
+}
+
+@MainActor
 private final class ReentrantPushToTalkScheduler: Scheduler {
     typealias Action = @Sendable @MainActor () -> Void
     var run: ((Action) -> Void)?
@@ -361,13 +423,15 @@ private final class PushToTalkCaptureFake: PushToTalkCapture {
     var phase: CaptureController.Phase = .idle
     var sessionID: UUID?
     var proposals: [UUID] = []
+    var deadlines: [ContinuousClock.Instant] = []
     var stops: [UUID] = []
     var cancellations: [UUID] = []
     var answer: PushToTalkStart?
     var onStart: ((UUID) -> Void)?
 
-    func start(proposing id: UUID) -> PushToTalkStart {
+    func start(proposing id: UUID, deadline: ContinuousClock.Instant) -> PushToTalkStart {
         proposals.append(id)
+        deadlines.append(deadline)
         sessionID = answer.flatMap { if case let .accepted(other) = $0 { other } else { nil } } ?? id
         phase = .awaitingPermission
         onStart?(id)

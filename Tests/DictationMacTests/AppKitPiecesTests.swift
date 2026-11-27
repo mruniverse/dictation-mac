@@ -40,7 +40,10 @@ final class CloudDialogsTests: XCTestCase {
     func testConsentTextSaysTheAutomaticStopAlsoSends() {
         let text = CloudDialogs.consentText(maxDuration: CaptureLimits().maxDuration)
 
-        XCTAssertTrue(text.contains("encerrada em Parar — ou pela parada automática, ao atingir 30 s — é enviada"), text)
+        XCTAssertTrue(text.contains("uma gravação manual é enviada ao Parar ou pela parada automática"), text)
+        XCTAssertTrue(text.contains("atingir 30 s"), text)
+        XCTAssertTrue(text.contains("soltar Ctrl+Shift+letra antes de 25 s envia o clipe"), text)
+        XCTAssertTrue(text.contains("alcançar esse prazo descarta o áudio sem envio"), text)
         XCTAssertTrue(text.contains("api.openai.com"))
         XCTAssertTrue(text.contains("à parte de qualquer assinatura do ChatGPT"))
         XCTAssertTrue(
