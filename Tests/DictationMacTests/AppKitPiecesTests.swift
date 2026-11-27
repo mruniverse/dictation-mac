@@ -72,6 +72,38 @@ final class CloudDialogsTests: XCTestCase {
         XCTAssertTrue(field.stringValue == String(fixture.dropLast()), "The field should keep the full paste and edit its last character")
     }
 
+    func testCaretStaysVisibleWhenMovingAcrossALongAPIKey() throws {
+        _ = NSApplication.shared
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        let alert = CloudDialogs.makeAPIKeyAlert(field: field)
+        alert.layout()
+        let window = alert.window
+        XCTAssertTrue(window.makeFirstResponder(field))
+        defer { _ = window.makeFirstResponder(nil); field.stringValue = "" }
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        let fixture = String(repeating: "AbCdEf0123456789", count: 11)
+        editor.insertText(fixture, replacementRange: editor.selectedRange())
+
+        editor.moveToBeginningOfLine(nil)
+        XCTAssertEqual(editor.selectedRange().location, 0)
+        let start = editor.visibleRect
+        let finalOffset = fixture.utf16.count
+        for _ in 0..<finalOffset { editor.moveRight(nil) }
+        XCTAssertEqual(editor.selectedRange(), NSRange(location: finalOffset, length: 0))
+        let end = editor.visibleRect
+        XCTAssertGreaterThan(end.minX, start.minX, "The viewport should follow the caret horizontally")
+        XCTAssertEqual(end.minY, start.minY, "The caret must stay on the same visual line")
+        let caret = editor.convert(window.convertFromScreen(editor.firstRect(forCharacterRange: editor.selectedRange(), actualRange: nil)), from: nil)
+        XCTAssertGreaterThanOrEqual(caret.minX, end.minX)
+        XCTAssertLessThan(caret.minX, end.maxX)
+
+        editor.moveToBeginningOfLine(nil)
+        XCTAssertEqual(editor.selectedRange().location, 0)
+        XCTAssertEqual(editor.visibleRect.minX, start.minX)
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertTrue(field.stringValue == fixture, "Navigating must not change the key")
+    }
+
     func testConsentTextSaysTheAutomaticStopAlsoSends() {
         let text = CloudDialogs.consentText(maxDuration: CaptureLimits().maxDuration)
 

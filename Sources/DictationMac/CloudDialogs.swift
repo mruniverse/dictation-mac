@@ -23,9 +23,9 @@ enum CloudDialogs {
     static func makeAPIKeyAlert(field: NSSecureTextField) -> NSAlert {
         field.placeholderString = "Cole a chave aqui"
         field.setAccessibilityLabel("Chave de API da OpenAI")
-        // Keep the masked line clipped to the field instead of scrolling its tail into view.
+        // Clip a single line and scroll horizontally with the caret instead of wrapping.
         field.cell?.wraps = false
-        field.cell?.isScrollable = false
+        field.cell?.isScrollable = true
         field.cell?.lineBreakMode = .byClipping
         let alert = NSAlert()
         alert.messageText = "Chave de API da OpenAI"
