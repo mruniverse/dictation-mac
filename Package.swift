@@ -8,5 +8,6 @@ let package = Package(
         .target(name: "DictationCore"),
         .executableTarget(name: "DictationMac", dependencies: ["DictationCore"]),
         .testTarget(name: "DictationCoreTests", dependencies: ["DictationCore"]),
+        .testTarget(name: "DictationMacTests", dependencies: ["DictationMac", "DictationCore"]),
     ]
 )

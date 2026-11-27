@@ -54,9 +54,14 @@ final class FakeCapture: AudioCapture {
 @MainActor
 final class FakeScheduler: Scheduler {
     private(set) var now: TimeInterval = 0
+    /// Runs a timer that is already due inside `schedule`, as the protocol allows for a zero delay.
+    var firesDueTimersImmediately = false
     private var timers: [(due: TimeInterval, action: @Sendable @MainActor () -> Void)] = []
 
+    var pendingTimers: Int { timers.count }
+
     func schedule(after delay: TimeInterval, _ action: @escaping @Sendable @MainActor () -> Void) {
+        if firesDueTimersImmediately, delay <= 0 { return action() }
         timers.append((now + delay, action))
     }
 
@@ -71,11 +76,30 @@ final class FakeScheduler: Scheduler {
 @MainActor
 final class FakeTranscriber: Transcriber {
     private(set) var received: [CapturedAudio] = []
+    /// Request indexes whose handle was cancelled, in order.
+    private(set) var cancelled: [Int] = []
+    /// Answers inside `transcribe`, before the handle is returned.
+    var immediateResult: Result<String, Error>?
+    /// Answers from inside `cancel()`, like a transport reporting its own cancellation.
+    var resultOnCancel: Result<String, Error>?
+    /// Runs inside `transcribe`, before the handle is returned, like a reentrant UI or timer callback.
+    var duringTranscribe: (@MainActor () -> Void)?
     private var completions: [@Sendable @MainActor (Result<String, Error>) -> Void] = []
 
-    func transcribe(_ audio: CapturedAudio, completion: @escaping @Sendable @MainActor (Result<String, Error>) -> Void) {
+    func transcribe(
+        _ audio: CapturedAudio,
+        completion: @escaping @Sendable @MainActor (Result<String, Error>) -> Void
+    ) -> TranscriptionCancellation {
+        let index = received.count
         received.append(audio)
         completions.append(completion)
+        duringTranscribe?()
+        if let immediateResult { completion(immediateResult) }
+        return TranscriptionCancellation { [weak self] in
+            guard let self else { return }
+            self.cancelled.append(index)
+            if let result = self.resultOnCancel { completion(result) }
+        }
     }
 
     func complete(_ result: Result<String, Error>, request index: Int = 0) {

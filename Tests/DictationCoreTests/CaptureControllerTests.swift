@@ -7,15 +7,17 @@ final class CaptureControllerTests: XCTestCase {
     private var capture: FakeCapture!
     private var scheduler: FakeScheduler!
 
-    private func makeController(transcriber: Transcriber? = nil) -> CaptureController {
+    private func makeController(transcriber: Transcriber? = nil, limits: CaptureLimits = CaptureLimits()) -> CaptureController {
         permission = FakePermission()
         capture = FakeCapture()
         scheduler = FakeScheduler()
-        return CaptureController(permission: permission, capture: capture, scheduler: scheduler, transcriber: transcriber)
+        return CaptureController(
+            permission: permission, capture: capture, scheduler: scheduler, transcriber: transcriber, limits: limits
+        )
     }
 
-    private func makeRecording(transcriber: Transcriber? = nil) -> CaptureController {
-        let controller = makeController(transcriber: transcriber)
+    private func makeRecording(transcriber: Transcriber? = nil, limits: CaptureLimits = CaptureLimits()) -> CaptureController {
+        let controller = makeController(transcriber: transcriber, limits: limits)
         controller.start()
         permission.answer(true)
         return controller
@@ -322,7 +324,7 @@ final class CaptureControllerTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome?.message, "Nenhum microfone disponível")
     }
 
-    // MARK: Transcriber contract (fake only; the app ships without a transcriber)
+    // MARK: Transcriber contract (fake transcriber; the app's cloud path is in CloudTranscriptionTests)
 
     private func makeProcessing(_ transcriber: FakeTranscriber, seconds: Double = 2.0) -> CaptureController {
         let controller = makeRecording(transcriber: transcriber)
@@ -415,5 +417,233 @@ final class CaptureControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.phase, .processing)
         XCTAssertEqual(permission.requests, 1)
+    }
+
+    // MARK: Request cancellation
+
+    func testCancelDuringProcessingCancelsRequestOnce() {
+        let transcriber = FakeTranscriber()
+        let controller = makeProcessing(transcriber)
+
+        controller.cancel()
+        controller.cancel()
+
+        XCTAssertEqual(transcriber.cancelled, [0])
+    }
+
+    func testDeadlineCancelsRequest() {
+        let transcriber = FakeTranscriber()
+        let controller = makeProcessing(transcriber)
+
+        scheduler.advance(by: 30)
+
+        XCTAssertEqual(transcriber.cancelled, [0])
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionTimedOut, duration: 2.0))
+    }
+
+    func testSuspensionDuringProcessingCancelsRequest() {
+        let transcriber = FakeTranscriber()
+        let controller = makeProcessing(transcriber)
+
+        controller.suspend()
+
+        XCTAssertEqual(transcriber.cancelled, [0])
+        XCTAssertEqual(controller.lastOutcome, .discarded(.suspended, duration: 2.0))
+    }
+
+    func testDeliveredResultLeavesNothingToCancel() {
+        let transcriber = FakeTranscriber()
+        let controller = makeProcessing(transcriber)
+
+        transcriber.complete(.failure(SyntheticError()))
+        controller.cancel()
+        scheduler.advance(by: 30)
+
+        XCTAssertEqual(transcriber.cancelled, [])
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionFailed, duration: 2.0))
+    }
+
+    func testAnswerFromInsideCancelIsIgnored() {
+        let transcriber = FakeTranscriber()
+        transcriber.resultOnCancel = .success("durante o cancelamento")
+        let controller = makeProcessing(transcriber)
+        var notifications = 0
+        controller.onChange = { notifications += 1 }
+
+        controller.cancel()
+
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertEqual(notifications, 1)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 2.0))
+    }
+
+    func testSynchronousAnswerIsReportedAndItsHandleIsNotKept() {
+        let transcriber = FakeTranscriber()
+        transcriber.immediateResult = .success("imediato")
+        let controller = makeProcessing(transcriber)
+        XCTAssertEqual(controller.lastOutcome, .transcribed("imediato", duration: 2.0))
+
+        controller.start()
+        permission.answer(true)
+        controller.cancel()
+
+        XCTAssertEqual(transcriber.cancelled, [], "a finished request must not be cancelled by a later session")
+    }
+
+    // MARK: Reentrancy (observers and schedulers that end the session inside stop/start)
+
+    func testCancelFromProcessingNotificationSendsNothing() {
+        let transcriber = FakeTranscriber()
+        let controller = makeRecording(transcriber: transcriber)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        controller.onChange = { if controller.phase == .processing { controller.cancel() } }
+        let armed = scheduler.pendingTimers
+
+        controller.stop()
+
+        XCTAssertEqual(transcriber.received.count, 0, "audio of a cancelled session must never reach the transcriber")
+        XCTAssertEqual(scheduler.pendingTimers, armed, "no processing deadline is armed for a session that already ended")
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertNil(controller.sessionID)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 2.0))
+        scheduler.advance(by: 30)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 2.0))
+    }
+
+    func testNewSessionStartedFromProcessingNotificationKeepsItsOwnState() {
+        let transcriber = FakeTranscriber()
+        let controller = makeRecording(transcriber: transcriber)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        var restarted = false
+        controller.onChange = {
+            guard controller.phase == .processing, !restarted else { return }
+            restarted = true
+            controller.cancel()
+            controller.start()
+        }
+
+        controller.stop()
+
+        XCTAssertEqual(transcriber.received.count, 0)
+        XCTAssertEqual(controller.phase, .awaitingPermission, "stop() of the old session must not touch the new one")
+        XCTAssertEqual(permission.requests, 2)
+    }
+
+    func testDeadlineFiringInsideScheduleSendsNothing() {
+        var limits = CaptureLimits()
+        limits.processingTimeout = 0
+        let transcriber = FakeTranscriber()
+        let controller = makeRecording(transcriber: transcriber, limits: limits)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        scheduler.firesDueTimersImmediately = true
+
+        controller.stop()
+
+        XCTAssertEqual(transcriber.received.count, 0)
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionTimedOut, duration: 2.0))
+    }
+
+    func testSessionEndedInsideTranscribeCancelsTheOrphanedRequest() {
+        let transcriber = FakeTranscriber()
+        let controller = makeRecording(transcriber: transcriber)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        transcriber.duringTranscribe = { controller.cancel() }
+
+        controller.stop()
+
+        XCTAssertEqual(transcriber.cancelled, [0], "the handle returned after the session ended must be cancelled")
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 2.0))
+    }
+
+    func testAnswerDeliveredAfterReentrantCancelInsideTranscribeIsIgnoredAndNotCancelled() {
+        let transcriber = FakeTranscriber()
+        transcriber.immediateResult = .success("depois do cancelamento")
+        let controller = makeRecording(transcriber: transcriber)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        transcriber.duringTranscribe = { controller.cancel() }
+
+        controller.stop()
+
+        XCTAssertEqual(transcriber.cancelled, [], "a request that already answered has nothing left to cancel")
+        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 2.0))
+    }
+
+    func testSynchronousAnswerWhoseNotificationStartsNextSessionIsNotCancelled() {
+        let transcriber = FakeTranscriber()
+        transcriber.immediateResult = .success("imediato")
+        let controller = makeRecording(transcriber: transcriber)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        var transcript: Outcome?
+        controller.onChange = {
+            guard controller.phase == .idle, transcript == nil else { return }
+            transcript = controller.lastOutcome
+            controller.start()
+        }
+
+        controller.stop()
+        permission.answer(true)
+        controller.cancel()
+
+        XCTAssertEqual(transcript, .transcribed("imediato", duration: 2.0))
+        XCTAssertEqual(transcriber.cancelled, [])
+        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 0))
+    }
+
+    func testCancelFromAwaitingPermissionNotificationNeverAsksPermission() {
+        let controller = makeController()
+        controller.onChange = { if controller.phase == .awaitingPermission { controller.cancel() } }
+
+        controller.start()
+
+        XCTAssertEqual(permission.requests, 0, "a cancelled session must not show the permission prompt")
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 0))
+    }
+
+    // MARK: Transcript and provider errors
+
+    func testBlankTranscriptIsNeverReportedAsText() {
+        let transcriber = FakeTranscriber()
+        let controller = makeProcessing(transcriber)
+
+        transcriber.complete(.success(" \n\t"))
+
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionEmpty, duration: 2.0))
+        XCTAssertEqual(controller.lastOutcome?.message, "Nenhuma fala reconhecida — áudio descartado (2,0 s)")
+    }
+
+    func testProviderErrorsMapToTheirOwnReasons() {
+        let cases: [(TranscriptionError, DiscardReason)] = [
+            (.missingCredential, .transcriptionUnavailable),
+            (.credentialUnavailable, .transcriptionKeychainUnavailable),
+            (.unauthorized, .transcriptionUnauthorized),
+            (.rateLimited, .transcriptionRateLimited),
+            (.unsupportedAudio, .transcriptionFailed),
+            (.rejected, .transcriptionFailed),
+            (.server, .transcriptionFailed),
+            (.network, .transcriptionFailed),
+            (.invalidResponse, .transcriptionFailed),
+        ]
+        for (error, reason) in cases {
+            let transcriber = FakeTranscriber()
+            let controller = makeProcessing(transcriber)
+
+            transcriber.complete(.failure(error))
+
+            XCTAssertEqual(controller.lastOutcome, .discarded(reason, duration: 2.0), "\(error)")
+        }
+    }
+
+    func testProviderErrorMessagesTellCredentialAndLimitApart() {
+        XCTAssertEqual(
+            Outcome.discarded(.transcriptionUnauthorized, duration: 1).message,
+            "Chave de API recusada ou sem permissão — áudio descartado (1,0 s)"
+        )
+        XCTAssertEqual(
+            Outcome.discarded(.transcriptionRateLimited, duration: 1).message,
+            "Limite ou cota do provedor atingido — áudio descartado (1,0 s)"
+        )
     }
 }
