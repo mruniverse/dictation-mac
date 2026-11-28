@@ -30,10 +30,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settings: CloudSettings { cloud.settings }
     private lazy var controller = CaptureController(
         permission: SystemMicrophonePermission(),
-        capture: EngineAudioCapture(),
+        capture: EngineAudioCapture(inputUID: { [weak self] in self?.inputDeviceSelection.chosen?.uid }),
         scheduler: MainQueueScheduler(),
         transcriber: cloud.transcriber,
         limits: limits
+    )
+    private lazy var inputDeviceSelection = InputDeviceSelection(storage: .standard)
+    private lazy var microphoneMenu = MicrophoneMenu(
+        catalog: CoreAudioInputDevices(),
+        selection: inputDeviceSelection,
+        isIdle: { [weak self] in self?.controller.phase == .idle }
     )
     private lazy var hotKeySettings = HotKeySettings(capture: controller, scheduler: MainQueueScheduler())
 
@@ -82,7 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.delegate = self
-        for item in [phaseItem, outcomeItem, .separator(), startItem, stopItem, cancelItem, copyItem, .separator(), hotKeyMenuItem, .separator(), cloudItem, .separator()] {
+        for item in [phaseItem, outcomeItem, .separator(), startItem, stopItem, cancelItem, copyItem, .separator(), hotKeyMenuItem, microphoneMenu.item, .separator(), cloudItem, .separator()] {
             menu.addItem(item)
         }
         menu.addItem(NSMenuItem(title: "Sair", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -96,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         settings.onChange = { [weak self] in self?.render() }
         hotKeySettings.onChange = { [weak self] in self?.render() }
+        inputDeviceSelection.onChange = { [weak self] in self?.render() }
         let workspace = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -199,6 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopItem.isEnabled = phase == .recording && controller.origin == .manual
         cancelItem.isEnabled = phase != .idle
         hotKeyStatusItem.title = hotKeySettings.menuStatus
+        microphoneMenu.refresh()
         toggleHotKeyItem.title = hotKeySettings.status == .active ? "Desativar atalho global" : "Ativar atalho global…"
         toggleHotKeyItem.isEnabled = phase == .idle || hotKeySettings.status == .active
         for (index, shortcut) in PushToTalkShortcut.allCases.enumerated() {

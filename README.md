@@ -2,7 +2,9 @@
 
 Dictation Mac aims to let you hold a shortcut, speak, release, and get punctuated text in the app you were using. The initial focus is Brazilian Portuguese and English. The MVP prioritizes cloud transcription using an explicit opt-in and the user's API key; local processing remains a separate option.
 
-**Status:** early development; no downloadable release. The menu-bar build has manual Start/Stop and an optional global hold-to-talk shortcut, off at every launch. Manual Stop or its 30 s limit may send only after explicit OpenAI authorization and first-send confirmation; with the shortcut enabled, release before 25 s submits only after authorization, while the deadline discards without sending. Transcripts are previewed/copied explicitly; the app does not type into other apps. Cloud behavior is tested with fakes only and has not been exercised against the real API or a physical global-keyboard smoke test.
+**Status:** early development; no downloadable release. The menu-bar build has manual Start/Stop and an optional global hold-to-talk shortcut, off at every launch. Manual Stop or its 30 s limit may send only after explicit OpenAI authorization and first-send confirmation; with the shortcut enabled, release before 25 s submits only after authorization, while the deadline discards without sending. Transcripts are previewed/copied explicitly; this build does not type into other apps. [Input selection](https://github.com/mruniverse/dictation-mac/issues/11) is covered by automated tests, but recording with a non-default device still needs a hardware test. No real speech-to-text round trip with the OpenAI API has been verified.
+
+Global hotkey scenarios such as modifier release order and Secure Input still need physical testing. Automated cloud tests use a fake transport.
 
 - [Product roadmap and engineering plan (PT-BR)](docs/plan.md)
 - [Cloud transcription: consent, key and status (PT-BR)](docs/cloud-transcription.md)
