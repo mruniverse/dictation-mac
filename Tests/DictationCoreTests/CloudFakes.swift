@@ -15,7 +15,7 @@ final class MemoryConsentStorage: ConsentStorage {
 
 /// In-memory key store that records every call, the thread it ran on, and fails on demand.
 final class FakeKeyStore: APIKeyStore {
-    enum Operation: Hashable, Sendable { case read, contains, save, delete }
+    enum Operation: Hashable, Sendable { case read, save, delete }
 
     private struct State {
         var key: OpenAIAPIKey?
@@ -32,7 +32,6 @@ final class FakeKeyStore: APIKeyStore {
 
     var calls: [Operation] { state.withLock { $0.calls } }
     var reads: Int { calls.filter { $0 == .read }.count }
-    var probes: Int { calls.filter { $0 == .contains }.count }
     var callsOnMainThread: Int { state.withLock { $0.callsOnMainThread } }
     /// The stored key, without counting as a call.
     var storedKey: OpenAIAPIKey? { state.withLock { $0.key } }
@@ -43,7 +42,6 @@ final class FakeKeyStore: APIKeyStore {
     }
 
     func read() throws -> OpenAIAPIKey? { try record(.read) { $0.key } }
-    func contains() throws -> Bool { try record(.contains) { $0.key != nil } }
     func save(_ key: OpenAIAPIKey) throws { try record(.save) { $0.key = key } }
     func delete() throws { try record(.delete) { $0.key = nil } }
 

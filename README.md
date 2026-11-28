@@ -2,7 +2,7 @@
 
 A native macOS dictation app in development. Hold a shortcut, speak, release, and get punctuated text in the app you were using. The initial focus is Brazilian Portuguese and English. The MVP prioritizes cloud transcription using an explicit opt-in and the user's API key; local processing remains a separate option.
 
-**Status:** early development; no downloadable release. The menu-bar build records a clip on explicit Start/Stop (or the automatic stop at 30 s) and, only after you store your own OpenAI API key in the Keychain, authorize sending and confirm the first upload, sends it for transcription. That cloud path is covered by automated tests with fakes only; it has not yet been exercised against the real API.
+**Status:** early development; no downloadable release. The menu-bar build records a clip on explicit Start/Stop (or the automatic stop at 30 s). Cloud transcription requires an OpenAI API key; loading a saved key is a separate, explicit action once per app run. Launching, recording, opening menus and sending never look up or read the Keychain. Sending also requires consent and confirmation of the first upload. Automated cloud tests use fake transport only; there has been no verified speech-to-text round trip against the real API. The latest physical capture opened the system-default line input and captured silence; selecting and testing the active mic is still pending. Text is currently previewed/copied, not inserted into other apps.
 
 - [Product roadmap and engineering plan (PT-BR)](docs/plan.md)
 - [Cloud transcription: consent, key and status (PT-BR)](docs/cloud-transcription.md)

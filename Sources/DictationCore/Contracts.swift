@@ -84,6 +84,8 @@ public enum TranscriptionError: Error, Equatable, Sendable {
     case declined
     /// No credential configured; nothing was sent.
     case missingCredential
+    /// No key was saved or explicitly loaded in this run; the Keychain was not consulted. Nothing was sent.
+    case credentialNotLoaded
     /// The keychain refused the lookup or the read (locked, access denied, damaged item): whether
     /// a key exists is unknown, so this is never reported as a missing key. Nothing was sent.
     case credentialUnavailable
@@ -122,6 +124,7 @@ public enum DiscardReason: Equatable, Sendable {
     case tooShort
     case silent
     case transcriptionUnavailable
+    case transcriptionKeyNotLoaded
     case transcriptionKeychainUnavailable
     case transcriptionNotAuthorized
     case transcriptionDeclined
@@ -158,6 +161,7 @@ extension DiscardReason {
         case .consentRequired: .transcriptionNotAuthorized
         case .declined: .transcriptionDeclined
         case .missingCredential: .transcriptionUnavailable
+        case .credentialNotLoaded: .transcriptionKeyNotLoaded
         case .credentialUnavailable: .transcriptionKeychainUnavailable
         case .unauthorized: .transcriptionUnauthorized
         case .rateLimited: .transcriptionRateLimited
@@ -176,6 +180,7 @@ extension DiscardReason {
         case .tooShort: "Gravação curta demais — áudio descartado"
         case .silent: "Silêncio — áudio descartado"
         case .transcriptionUnavailable: "Transcrição não configurada — áudio descartado"
+        case .transcriptionKeyNotLoaded: "Chave de API não carregada nesta execução — áudio descartado"
         case .transcriptionKeychainUnavailable: "Keychain não liberou a chave de API — áudio descartado"
         case .transcriptionNotAuthorized: "Envio à OpenAI não autorizado — áudio descartado"
         case .transcriptionDeclined: "Envio recusado — áudio descartado"

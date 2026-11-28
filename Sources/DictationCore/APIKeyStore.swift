@@ -1,12 +1,12 @@
 import Foundation
 import Security
 
-/// Where the user's API key lives. Implementations never log, print or describe the key.
+/// Where the user's API key lives. Implementations never log, print or describe the key. Every
+/// call may wait on a system dialog, so only `CloudSettings` calls them, on the keychain queue and
+/// only on the user's explicit load, save or removal.
 public protocol APIKeyStore: Sendable {
     /// The stored key, or nil when there is none. May show the system keychain authorization dialog.
     func read() throws -> OpenAIAPIKey?
-    /// Whether a key is stored, without reading the secret.
-    func contains() throws -> Bool
     /// Replaces any stored key.
     func save(_ key: OpenAIAPIKey) throws
     /// Idempotent.
@@ -29,22 +29,17 @@ public struct KeychainError: Error, Equatable, Sendable, CustomStringConvertible
     }
 }
 
-/// What the key lookup found. A keychain failure is its own case: it never reads as a missing key.
+/// This run's API key, as the last explicit load, save or removal left it. The Keychain is never
+/// consulted just to tell: a failure is its own case and never reads as a missing key.
 public enum APIKeyStatus: Equatable, Sendable {
-    /// Not looked up yet.
-    case unknown
-    case stored
+    /// Nothing in memory: no key was saved or loaded in this run. A saved key may exist.
+    case notLoaded
+    /// In memory for this run, after an explicit save or load; clips use it without the Keychain.
+    case loaded
+    /// The explicit load found no saved key, or the removal deleted it.
     case missing
-    /// The keychain refused the lookup (locked, access denied, damaged item): a key may exist.
+    /// The keychain refused the explicit load (locked, access denied, damaged item): a key may exist.
     case unavailable(KeychainError)
-
-    init(lookup: Result<Bool, Error>) {
-        self = switch lookup {
-        case .success(true): .stored
-        case .success(false): .missing
-        case let .failure(error): .unavailable(KeychainError(error))
-        }
-    }
 }
 
 /// One generic-password item in the user's login keychain. That is the file-based keychain: the
@@ -93,17 +88,6 @@ public struct KeychainAPIKeyStore: APIKeyStore {
             return nil
         default:
             throw KeychainError(status: status)
-        }
-    }
-
-    public func contains() throws -> Bool {
-        var query = item
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        // No kSecReturnData: the secret is never decrypted, so no authorization dialog is needed.
-        switch keychain.copy(query).status {
-        case errSecSuccess: return true
-        case errSecItemNotFound: return false
-        case let status: throw KeychainError(status: status)
         }
     }
 

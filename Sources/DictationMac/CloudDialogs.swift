@@ -14,7 +14,8 @@ enum CloudDialogs {
         let alert = NSAlert()
         alert.messageText = "Chave de API da OpenAI"
         alert.informativeText = """
-            A chave fica só no Keychain deste Mac e nunca aparece no menu nem em logs.
+            A chave fica no Keychain deste Mac e, nesta execução, em memória; nunca aparece no \
+            menu nem em logs. Nas próximas execuções, use “Carregar chave salva do Keychain”.
 
             Salvar a chave não autoriza o envio de áudio: a autorização é um passo separado, \
             em “Autorizar envio à OpenAI…”.
