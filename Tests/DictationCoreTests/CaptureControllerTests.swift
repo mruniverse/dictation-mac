@@ -666,3 +666,233 @@ final class CaptureControllerTests: XCTestCase {
         )
     }
 }
+
+
+/// Typed hooks for the owner of a session (the text-insertion pilot): `onPushToTalkAccepted` once an
+/// accepted held session is waiting for permission and before the microphone is asked, and
+/// `onFinish` exactly once per session with the ID and origin it had, after the controller is idle.
+@MainActor
+final class CaptureControllerHookTests: XCTestCase {
+    private struct Finish: Equatable {
+        let id: UUID
+        let origin: CaptureController.Origin
+        let outcome: Outcome
+    }
+
+    private var permission: FakePermission!
+    private var capture: FakeCapture!
+    private var scheduler: FakeScheduler!
+    private var clock: TestClock!
+    private var transcriber: FakeTranscriber!
+    private var controller: CaptureController!
+    private var accepted: [UUID] = []
+    private var finishes: [Finish] = []
+
+    override func setUp() async throws {
+        permission = FakePermission()
+        capture = FakeCapture()
+        scheduler = FakeScheduler()
+        clock = TestClock()
+        transcriber = FakeTranscriber()
+        let clock = clock!
+        controller = CaptureController(
+            permission: permission, capture: capture, scheduler: scheduler, transcriber: transcriber,
+            now: { clock.now }
+        )
+        controller.onPushToTalkAccepted = { [unowned self] in accepted.append($0) }
+        controller.onFinish = { [unowned self] in finishes.append(Finish(id: $0, origin: $1, outcome: $2)) }
+    }
+
+    private func propose(_ id: UUID = UUID(), hold: Double = 25) -> PushToTalkStart {
+        controller.start(proposing: id, deadline: clock.now.advanced(by: .seconds(hold)))
+    }
+
+    // MARK: Accepted held session
+
+    func testAcceptedHookRunsOnceForTheHeldSessionBeforeThePermissionRequest() {
+        let id = UUID()
+        var seenAtHook: (phase: CaptureController.Phase, session: UUID?, requests: Int)?
+        controller.onPushToTalkAccepted = { [unowned self] in
+            accepted.append($0)
+            seenAtHook = (controller.phase, controller.sessionID, permission.requests)
+        }
+
+        XCTAssertEqual(propose(id), .accepted(id))
+
+        XCTAssertEqual(accepted, [id], "HOOK-RED: aceito deve ser chamado uma vez com o ID proposto")
+        XCTAssertEqual(seenAtHook?.phase, .awaitingPermission, "HOOK-RED: hook após constatar awaitingPermission")
+        XCTAssertEqual(seenAtHook?.session, id, "HOOK-RED: hook vê a sessão aceita")
+        XCTAssertEqual(seenAtHook?.requests, 0, "HOOK-RED: hook antes de pedir o microfone")
+        XCTAssertEqual(permission.requests, 1, "HOOK-RED: o pedido de permissão segue após o hook")
+        XCTAssertTrue(finishes.isEmpty)
+    }
+
+    func testManualStartAndRejectedProposalsNeverCallTheAcceptedHook() {
+        controller.start()
+        XCTAssertEqual(propose(), .rejected)
+        controller.cancel()
+        XCTAssertEqual(propose(hold: 0), .rejected, "deadline already reached")
+
+        XCTAssertEqual(accepted, [], "HOOK-RED: manual ou rejeitado não aciona o hook de PTT")
+        XCTAssertEqual(finishes.map(\.origin), [.manual], "HOOK-RED: só a sessão manual terminou")
+    }
+
+    func testObserverEndingTheSessionBeforeTheHookSkipsItAndTheMicrophone() {
+        controller.onChange = { [unowned self] in
+            if controller.phase == .awaitingPermission, let id = controller.sessionID { controller.cancel(session: id) }
+        }
+        let id = UUID()
+
+        _ = propose(id)
+
+        XCTAssertEqual(accepted, [], "HOOK-RED: sessão encerrada pelo observador não chega ao hook")
+        XCTAssertEqual(permission.requests, 0)
+        XCTAssertEqual(finishes, [Finish(id: id, origin: .pushToTalk, outcome: .discarded(.cancelled, duration: 0))])
+    }
+
+    func testHookThatEndsTheSessionKeepsTheMicrophoneUnasked() {
+        controller.onPushToTalkAccepted = { [unowned self] id in
+            accepted.append(id)
+            controller.cancel(session: id)
+        }
+        let id = UUID()
+
+        _ = propose(id)
+
+        XCTAssertEqual(accepted, [id])
+        XCTAssertEqual(permission.requests, 0, "HOOK-RED: rechecagem de sessão após o hook")
+        XCTAssertEqual(capture.starts, 0)
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertEqual(finishes, [Finish(id: id, origin: .pushToTalk, outcome: .discarded(.cancelled, duration: 0))])
+    }
+
+    func testDeadlinePassingInsideTheHookDiscardsWithoutAskingTheMicrophone() {
+        controller.onPushToTalkAccepted = { [unowned self] id in
+            accepted.append(id)
+            clock.advance(by: 25) // a slow target inspection
+        }
+        let id = UUID()
+
+        _ = propose(id)
+
+        XCTAssertEqual(permission.requests, 0, "HOOK-RED: rechecagem do prazo após o hook")
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.pushToTalkExpired, duration: 0))
+        XCTAssertEqual(finishes, [Finish(id: id, origin: .pushToTalk, outcome: .discarded(.pushToTalkExpired, duration: 0))])
+    }
+
+    // MARK: Finish
+
+    func testValidReleaseReportsIDOriginAndTranscriptOnceAfterTheControllerIsIdle() {
+        let id = UUID()
+        var stateAtFinish: (CaptureController.Phase, UUID?, CaptureController.Origin?, Outcome?)?
+        controller.onFinish = { [unowned self] in
+            finishes.append(Finish(id: $0, origin: $1, outcome: $2))
+            stateAtFinish = (controller.phase, controller.sessionID, controller.origin, controller.lastOutcome)
+        }
+        _ = propose(id)
+        permission.answer(true)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+
+        controller.stop(session: id)
+        XCTAssertTrue(finishes.isEmpty, "HOOK-RED: processando ainda não terminou")
+        transcriber.complete(.success("texto"))
+        transcriber.complete(.success("tarde"))
+        controller.stop(session: id)
+        controller.cancel(session: id)
+
+        let outcome = Outcome.transcribed("texto", duration: 2.0)
+        XCTAssertEqual(finishes, [Finish(id: id, origin: .pushToTalk, outcome: outcome)], "HOOK-RED: um único fim por sessão")
+        XCTAssertEqual(stateAtFinish?.0, .idle, "HOOK-RED: fim entregue com o controller já ocioso")
+        XCTAssertNil(stateAtFinish?.1)
+        XCTAssertNil(stateAtFinish?.2)
+        XCTAssertEqual(stateAtFinish?.3, outcome, "HOOK-RED: prévia/cópia já disponível no fim")
+    }
+
+    func testManualSessionReportsManualOrigin() {
+        controller.start()
+        let id = controller.sessionID
+        permission.answer(true)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        controller.stop()
+        transcriber.complete(.success("manual"))
+
+        XCTAssertEqual(finishes.map(\.id), [id].compactMap { $0 })
+        XCTAssertEqual(finishes.map(\.origin), [.manual], "HOOK-RED: origem manual preservada")
+        XCTAssertEqual(accepted, [])
+    }
+
+    func testMenuStopAndStaleCallsNeverFinishAHeldSession() {
+        let id = UUID()
+        _ = propose(id)
+        permission.answer(true)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+
+        controller.stop()
+        controller.stop(session: UUID())
+        controller.cancel(session: UUID())
+        XCTAssertEqual(controller.phase, .recording)
+        XCTAssertTrue(finishes.isEmpty, "HOOK-RED: Parar do menu e IDs antigos não encerram a sessão PTT")
+
+        controller.cancel(session: id)
+        controller.cancel()
+        controller.suspend()
+        XCTAssertEqual(finishes, [Finish(id: id, origin: .pushToTalk, outcome: .discarded(.cancelled, duration: 2.0))])
+    }
+
+    // MARK: Reentrant observers
+
+    func testReentrantEndingCallsInsideFinishDoNotReportAgain() {
+        let id = UUID()
+        controller.onFinish = { [unowned self] in
+            finishes.append(Finish(id: $0, origin: $1, outcome: $2))
+            controller.cancel()
+            controller.suspend()
+            controller.cancel(session: $0)
+            controller.stop(session: $0)
+        }
+        _ = propose(id)
+        permission.answer(true)
+        capture.feed(Synthetic.tone(seconds: 2.0))
+        controller.stop(session: id)
+        transcriber.complete(.success("texto"))
+
+        XCTAssertEqual(finishes.count, 1, "HOOK-RED: reentrância não duplica o fim")
+        XCTAssertEqual(controller.lastOutcome, .transcribed("texto", duration: 2.0), "HOOK-RED: reentrância não apaga a prévia")
+    }
+
+    func testSessionStartedInsideFinishGetsItsOwnHooks() {
+        let first = UUID()
+        let second = UUID()
+        controller.onFinish = { [unowned self] id, origin, outcome in
+            finishes.append(Finish(id: id, origin: origin, outcome: outcome))
+            if id == first { _ = propose(second) }
+        }
+        _ = propose(first)
+        controller.cancel(session: first)
+        XCTAssertEqual(controller.sessionID, second)
+        controller.cancel(session: second)
+
+        XCTAssertEqual(accepted, [first, second], "HOOK-RED: cada sessão aceita uma vez")
+        XCTAssertEqual(finishes.map(\.id), [first, second], "HOOK-RED: cada sessão termina uma vez, com seu ID")
+    }
+
+    func testSessionStartedFromTheIdleTransitionDoesNotStealTheEndedSessionsReport() {
+        let first = UUID()
+        let second = UUID()
+        var startedSecond = false
+        controller.onChange = { [unowned self] in
+            if controller.phase == .idle, !startedSecond {
+                startedSecond = true
+                _ = propose(second)
+            }
+        }
+        _ = propose(first)
+        controller.cancel(session: first)
+
+        XCTAssertEqual(controller.sessionID, second)
+        XCTAssertEqual(accepted, [first, second])
+        XCTAssertEqual(finishes, [Finish(id: first, origin: .pushToTalk, outcome: .discarded(.cancelled, duration: 0))],
+                       "HOOK-RED: o fim da primeira sessão mantém o ID dela mesmo com outra já aberta")
+    }
+}
