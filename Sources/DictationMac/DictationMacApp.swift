@@ -22,10 +22,27 @@ enum DictationMacApp {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let limits = CaptureLimits()
+    private let insertionPilot: TextEditInsertionPilot
+
+    init(insertionPilot: TextEditInsertionPilot = TextEditInsertionPilot()) {
+        self.insertionPilot = insertionPilot
+        super.init()
+    }
+
+    func makeFirstSendConfirmation(
+        present: @escaping ConsentGatedTranscriber.FirstSendConfirmation
+    ) -> ConsentGatedTranscriber.FirstSendConfirmation {
+        { [weak self] duration, reply in
+            // The prompt takes focus, so drop the locked TextEdit target before presenting it.
+            self?.insertionPilot.invalidate()
+            return present(duration, reply)
+        }
+    }
+
     private lazy var cloud = CloudTranscription.openAI(
         keys: KeychainAPIKeyStore(),
         consent: CloudConsent(storage: UserDefaults.standard),
-        confirmFirstSend: { FirstSendPrompt.ask(duration: $0, reply: $1) }
+        confirmFirstSend: makeFirstSendConfirmation(present: FirstSendPrompt.ask)
     )
     private var settings: CloudSettings { cloud.settings }
     private lazy var controller = CaptureController(
@@ -46,6 +63,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private let phaseItem = AppDelegate.infoItem()
     private let outcomeItem = AppDelegate.infoItem()
+    private let insertionResultItem = AppDelegate.infoItem()
+    private let insertionStatusItem = AppDelegate.infoItem()
+    private lazy var toggleInsertionItem = actionItem("Ativar inserção no TextEdit", #selector(toggleTextInsertion))
+    private lazy var insertionMenuItem: NSMenuItem = {
+        let item = NSMenuItem(title: "Inserção no TextEdit (experimental)", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        submenu.delegate = self
+        submenu.addItem(insertionStatusItem)
+        submenu.addItem(toggleInsertionItem)
+        item.submenu = submenu
+        return item
+    }()
     private lazy var startItem = actionItem("Iniciar", #selector(startCapture))
     private lazy var stopItem = actionItem("Parar", #selector(stopCapture))
     private lazy var cancelItem = actionItem("Cancelar", #selector(cancelCapture))
@@ -88,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.delegate = self
-        for item in [phaseItem, outcomeItem, .separator(), startItem, stopItem, cancelItem, copyItem, .separator(), hotKeyMenuItem, microphoneMenu.item, .separator(), cloudItem, .separator()] {
+        for item in [phaseItem, outcomeItem, insertionResultItem, .separator(), startItem, stopItem, cancelItem, copyItem, .separator(), hotKeyMenuItem, insertionMenuItem, microphoneMenu.item, .separator(), cloudItem, .separator()] {
             menu.addItem(item)
         }
         menu.addItem(NSMenuItem(title: "Sair", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -100,6 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.hotKeySettings.captureChanged()
             self?.render()
         }
+        insertionPilot.attach(to: controller) { [weak self] in self?.render() }
         settings.onChange = { [weak self] in self?.render() }
         hotKeySettings.onChange = { [weak self] in self?.render() }
         inputDeviceSelection.onChange = { [weak self] in self?.render() }
@@ -107,16 +138,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
+                    self?.insertionPilot.disable(.suspended)
                     self?.controller.suspend()
                     self?.hotKeySettings.suspend()
                 }
             }
+        }
+        // Another app took the focus: the dictation target is invalidated, even if it comes back.
+        workspace.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+            MainActor.assumeIsolated { self?.insertionPilot.applicationActivated(pid: pid) }
         }
         render()
         settings.refreshKeyStatus()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        insertionPilot.disable()
         hotKeySettings.disable()
         controller.cancel()
     }
@@ -136,6 +174,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleHotKey() {
         if hotKeySettings.status == .active { hotKeySettings.disable() }
         else if controller.phase == .idle { hotKeySettings.enable() }
+    }
+
+    /// Off at every launch; may open the system's Accessibility request, only from this click.
+    @objc private func toggleTextInsertion() {
+        guard controller.phase == .idle else { return }
+        insertionPilot.toggle()
     }
 
     @objc private func selectPushToTalkShortcut(_ sender: NSMenuItem) {
@@ -202,6 +246,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         phaseItem.title = label
         outcomeItem.title = Self.abbreviated(controller.lastOutcome?.message ?? "")
         outcomeItem.isHidden = controller.lastOutcome == nil
+        // States only whether the text went in; never repeats it.
+        insertionResultItem.title = insertionPilot.resultStatus ?? ""
+        insertionResultItem.isHidden = controller.lastOutcome == nil || insertionPilot.resultStatus == nil
+        insertionStatusItem.title = insertionPilot.menuStatus
+        toggleInsertionItem.title = insertionPilot.isEnabled ? "Desativar inserção no TextEdit" : "Ativar inserção no TextEdit"
+        toggleInsertionItem.isEnabled = phase == .idle
         startItem.isEnabled = phase == .idle
         stopItem.isEnabled = phase == .recording && controller.origin == .manual
         cancelItem.isEnabled = phase != .idle

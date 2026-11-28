@@ -24,6 +24,13 @@ public final class CaptureController {
     public private(set) var origin: Origin?
     public private(set) var lastOutcome: Outcome?
     public var onChange: (() -> Void)?
+    /// Once per accepted held session, while it waits for permission and before the microphone is
+    /// asked. The session and its deadline are checked again afterwards, so the owner may take time
+    /// (e.g. inspect the focused target) or end the session from here.
+    public var onPushToTalkAccepted: ((UUID) -> Void)?
+    /// Exactly once per session, with the ID and origin it had and its outcome, after the transition to
+    /// idle has been notified. An observer may already have opened the next session, which gets its own calls.
+    public var onFinish: ((UUID, Origin, Outcome) -> Void)?
 
     private let permission: MicrophonePermission
     private let capture: AudioCapture
@@ -104,6 +111,12 @@ public final class CaptureController {
         transition(to: .awaitingPermission)
         // The observer may have ended the session; a cancelled session must not show the system prompt.
         guard isCurrent(id, .awaitingPermission) else { return }
+        if origin == .pushToTalk, let accepted = onPushToTalkAccepted {
+            accepted(id)
+            // The owner may have ended the session, or its deadline may have passed meanwhile.
+            guard isCurrent(id, .awaitingPermission) else { return }
+            guard !isExpired else { return end(.discarded(.pushToTalkExpired, duration: 0)) }
+        }
         permission.requestAccess { [weak self] granted in self?.permissionAnswered(granted, session: id) }
     }
 
@@ -201,6 +214,8 @@ public final class CaptureController {
     }
 
     private func end(_ outcome: Outcome) {
+        // Kept for the owner before the session is cleared: an observer may open the next one.
+        let ended = sessionID.flatMap { id in origin.map { (id: id, origin: $0) } }
         capture.stop()
         samples = []
         sampleRate = nil
@@ -214,6 +229,7 @@ public final class CaptureController {
         pending?.cancel()
         lastOutcome = outcome
         transition(to: .idle)
+        if let ended { onFinish?(ended.id, ended.origin, outcome) }
     }
 
     /// A held session at or past its deadline; never true for a manual session.
