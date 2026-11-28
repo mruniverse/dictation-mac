@@ -4,13 +4,25 @@ import DictationCore
 import XCTest
 
 /// CoreAudio adapter. The device walk is opt-in (`DICTATION_MAC_AUDIO_PROBE=1`) because it reads
-/// the host's real devices; it configures engines but never starts one, so no audio is captured.
+/// the host's real devices; it only reads HAL properties and never creates an engine, so no device
+/// is opened and no audio is captured.
 @MainActor
 final class CoreAudioInputDevicesTests: XCTestCase {
+    /// Resolves the UID against the host's real HAL list (read-only) and must fail before any engine exists.
     func testUnknownChosenDeviceFailsInsteadOfFallingBackToTheDefault() {
-        XCTAssertThrowsError(try EngineAudioCapture.makeEngine(inputUID: "dictation-mac-missing-\(UUID().uuidString)")) {
+        var enginesCreated = 0
+        let capture = EngineAudioCapture(
+            inputUID: { "dictation-mac-missing-\(UUID().uuidString)" },
+            makeEngine: {
+                enginesCreated += 1
+                return SystemCaptureEngine()
+            }
+        )
+
+        XCTAssertThrowsError(try capture.start(onChunk: { _ in }, onFailure: { _ in })) {
             XCTAssertEqual($0 as? CaptureFailure, .selectedDeviceUnavailable)
         }
+        XCTAssertEqual(enginesCreated, 0)
     }
 
     func testEveryListedDeviceHasAnInputFormatWithoutOpeningIt() throws {
