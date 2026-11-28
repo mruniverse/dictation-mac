@@ -22,14 +22,27 @@ enum DictationMacApp {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let limits = CaptureLimits()
+    private let insertionPilot: TextEditInsertionPilot
+
+    init(insertionPilot: TextEditInsertionPilot = TextEditInsertionPilot()) {
+        self.insertionPilot = insertionPilot
+        super.init()
+    }
+
+    func makeFirstSendConfirmation(
+        present: @escaping ConsentGatedTranscriber.FirstSendConfirmation
+    ) -> ConsentGatedTranscriber.FirstSendConfirmation {
+        { [weak self] duration, reply in
+            // The prompt takes focus, so drop the locked TextEdit target before presenting it.
+            self?.insertionPilot.invalidate()
+            return present(duration, reply)
+        }
+    }
+
     private lazy var cloud = CloudTranscription.openAI(
         keys: KeychainAPIKeyStore(),
         consent: CloudConsent(storage: UserDefaults.standard),
-        confirmFirstSend: { [weak self] duration, reply in
-            // The question takes the focus: the dictation target is gone before it appears.
-            self?.insertionPilot.invalidate()
-            return FirstSendPrompt.ask(duration: duration, reply: reply)
-        }
+        confirmFirstSend: makeFirstSendConfirmation(present: FirstSendPrompt.ask)
     )
     private var settings: CloudSettings { cloud.settings }
     private lazy var controller = CaptureController(
@@ -46,7 +59,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isIdle: { [weak self] in self?.controller.phase == .idle }
     )
     private lazy var hotKeySettings = HotKeySettings(capture: controller, scheduler: MainQueueScheduler())
-    private lazy var insertionPilot = TextEditInsertionPilot()
 
     private var statusItem: NSStatusItem?
     private let phaseItem = AppDelegate.infoItem()
