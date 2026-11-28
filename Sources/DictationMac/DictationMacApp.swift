@@ -23,11 +23,13 @@ enum DictationMacApp {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let limits = CaptureLimits()
     private lazy var cloud = CloudTranscription.openAI(
-        keys: KeychainAPIKeyStore(),
+        keys: keyStore,
         consent: CloudConsent(storage: UserDefaults.standard),
         confirmFirstSend: { FirstSendPrompt.ask(duration: $0, reply: $1) }
     )
     private var settings: CloudSettings { cloud.settings }
+    /// The app's Keychain item; replaced only by tests, before the menu is first used.
+    var keyStore: any APIKeyStore = KeychainAPIKeyStore()
     private lazy var controller = CaptureController(
         permission: SystemMicrophonePermission(),
         capture: EngineAudioCapture(),
@@ -46,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let keyStatusItem = AppDelegate.infoItem()
     private let consentStatusItem = AppDelegate.infoItem()
     private lazy var setKeyItem = actionItem("Configurar chave de API…", #selector(setAPIKey))
+    private lazy var loadKeyItem = actionItem("Carregar chave salva do Keychain", #selector(loadAPIKey))
     private lazy var removeKeyItem = actionItem("Remover chave de API", #selector(removeAPIKey))
     private lazy var grantItem = actionItem("Autorizar envio à OpenAI…", #selector(grantConsent))
     private lazy var revokeItem = actionItem("Revogar autorização de envio", #selector(revokeConsent))
@@ -53,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let cloudMenu = NSMenu()
         cloudMenu.autoenablesItems = false
-        for item in [keyStatusItem, consentStatusItem, .separator(), setKeyItem, removeKeyItem, .separator(), grantItem, revokeItem] {
+        for item in [keyStatusItem, consentStatusItem, .separator(), loadKeyItem, setKeyItem, removeKeyItem, .separator(), grantItem, revokeItem] {
             cloudMenu.addItem(item)
         }
         let cloudItem = NSMenuItem(title: "Transcrição na nuvem (OpenAI)", action: nil, keyEquivalent: "")
@@ -79,16 +82,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         render()
-        settings.refreshKeyStatus()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         controller.cancel()
     }
 
-    /// The lookup runs on the keychain queue; the menu updates when it answers.
+    /// Shows this run's key status as it is in memory; opening the menu never touches the Keychain.
     func menuWillOpen(_ menu: NSMenu) {
-        settings.refreshKeyStatus()
+        render()
     }
 
     // MARK: Capture
@@ -106,6 +108,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Cloud settings
 
+    /// The only read of the saved key: once, on this click, for this run. The system may ask to
+    /// allow it; the app never asks for "Sempre Permitir".
+    @objc private func loadAPIKey() {
+        settings.loadKey { [weak self] failure in
+            guard let failure else { return }
+            let kept = self?.settings.keyStatus == .loaded ? " A chave já carregada continua em uso nesta execução." : ""
+            CloudDialogs.notify("Chave não carregada", Self.keychainFailure(failure) + kept)
+        }
+    }
+
     @objc private func setAPIKey() {
         guard controller.phase == .idle, let key = CloudDialogs.askForAPIKey(),
               controller.phase == .idle else { return }
@@ -114,10 +126,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Takes effect at once: a clip on its way is discarded unsent; then the item is deleted.
+    /// Takes effect at once: this run's key is forgotten, consent revoked and a clip on its way
+    /// discarded unsent; then the item is deleted.
     @objc private func removeAPIKey() {
         settings.removeKey { failure in
-            if let failure { CloudDialogs.notify("Chave não removida", Self.keychainFailure(failure)) }
+            guard let failure else { return }
+            let detail = " Ela já não é usada nesta execução e o envio foi desautorizado."
+            CloudDialogs.notify("Chave não removida do Keychain", Self.keychainFailure(failure) + detail)
         }
     }
 
@@ -159,12 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if case .transcribed = controller.lastOutcome { copyItem.isEnabled = true } else { copyItem.isEnabled = false }
 
         let keyStatus = settings.keyStatus
-        keyStatusItem.title = switch keyStatus {
-        case .unknown: "Chave de API: verificando o Keychain…"
-        case .stored: "Chave de API: guardada no Keychain"
-        case .missing: "Chave de API: não configurada"
-        case let .unavailable(failure): "Chave de API: Keychain indisponível (código \(failure.status))"
-        }
+        keyStatusItem.title = Self.keyStatusTitle(keyStatus, waiting: settings.isWaitingForKeychain)
         let state = settings.consent.state
         consentStatusItem.title = switch state {
         case .notGranted: "Envio de áudio: não autorizado"
@@ -173,6 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // Settings dialogs run modally, so they open only while no session runs.
         setKeyItem.isEnabled = phase == .idle
+        loadKeyItem.isEnabled = !settings.isWaitingForKeychain
         removeKeyItem.isEnabled = keyStatus != .missing
         grantItem.isEnabled = phase == .idle && state == .notGranted
         revokeItem.isEnabled = state != .notGranted
@@ -180,6 +191,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private static func abbreviated(_ text: String, limit: Int = 90) -> String {
         text.count <= limit ? text : String(text.prefix(limit)) + "…"
+    }
+
+    /// What is in memory for this run; never the result of a Keychain lookup made to draw the menu.
+    static func keyStatusTitle(_ status: APIKeyStatus, waiting: Bool) -> String {
+        if waiting { return "Chave de API: aguardando o Keychain…" }
+        return switch status {
+        case .notLoaded: "Chave de API: não carregada nesta execução"
+        case .loaded: "Chave de API: carregada nesta execução"
+        case .missing: "Chave de API: nenhuma salva no Keychain"
+        case let .unavailable(failure): "Chave de API: Keychain não liberou (código \(failure.status))"
+        }
     }
 
     private static func infoItem() -> NSMenuItem {

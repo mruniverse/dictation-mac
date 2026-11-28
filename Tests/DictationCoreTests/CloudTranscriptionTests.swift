@@ -3,8 +3,9 @@ import os
 import Security
 import XCTest
 
-/// Consent, key and first-send confirmation in front of the provider, and the settings that
-/// withdraw them. Fakes only: no keychain, defaults, network or microphone.
+/// Consent, this run's key and the first-send confirmation in front of the provider, and the
+/// settings that load, save, remove or withdraw them. Fakes only: no keychain, defaults, network
+/// or microphone.
 @MainActor
 final class ConsentGateTests: XCTestCase {
     private var permission: FakePermission!
@@ -29,11 +30,14 @@ final class ConsentGateTests: XCTestCase {
         queue = ManualKeychainQueue()
         confirmer = FakeConfirmer()
         provider = FakeTranscriber()
-        let gate = ConsentGatedTranscriber(
-            provider: provider, consent: consent, keys: keys, queue: queue, confirmFirstSend: confirmer.confirmation
+        // The app's composition, with the provider swapped for a fake.
+        let cloud = CloudTranscription.compose(
+            keys: keys, consent: consent, confirmFirstSend: confirmer.confirmation, queue: queue
+        ) { _ in self.provider }
+        settings = cloud.settings
+        controller = CaptureController(
+            permission: permission, capture: capture, scheduler: scheduler, transcriber: cloud.transcriber
         )
-        settings = CloudSettings(consent: consent, keys: keys, queue: queue, gate: gate)
-        controller = CaptureController(permission: permission, capture: capture, scheduler: scheduler, transcriber: gate)
     }
 
     /// Records a synthetic clip and stops, handing it to the gate.
@@ -42,6 +46,16 @@ final class ConsentGateTests: XCTestCase {
         permission.answer(true)
         capture.feed(Synthetic.tone(seconds: seconds))
         controller.stop()
+    }
+
+    /// The user's explicit "Carregar chave salva do Keychain"; the queue answers at once unless held.
+    private func loadKey() {
+        settings.loadKey { XCTAssertNil($0) }
+    }
+
+    private func grantAndLoadKey() {
+        consent.grant()
+        loadKey()
     }
 
     // MARK: Consent
@@ -57,6 +71,15 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome?.message, "Envio à OpenAI não autorizado — áudio descartado (2,0 s)")
     }
 
+    func testALoadedKeyWithoutConsentSendsNothing() {
+        loadKey()
+
+        recordAndStop()
+
+        XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
+    }
+
     func testSavingAKeyNeverGrantsConsent() {
         settings.saveKey(OpenAIAPIKey("another-placeholder-key")!) { XCTAssertNil($0) }
 
@@ -65,62 +88,92 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertTrue(provider.received.isEmpty)
     }
 
-    func testConsentWithoutKeyNeverAsksOrSends() throws {
+    // MARK: This run's key: the Keychain is read only on an explicit load, never by a clip
+
+    func testConsentWithoutALoadedKeyNeverAsksSendsOrTouchesTheKeychain() {
         consent.grant()
-        try keys.delete()
 
         recordAndStop()
 
         XCTAssertTrue(confirmer.asked.isEmpty)
         XCTAssertTrue(provider.received.isEmpty)
-        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
+        XCTAssertEqual(keys.calls, [], "a saved key is neither looked up nor read unless the user loads it")
+        XCTAssertEqual(settings.keyStatus, .notLoaded)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionKeyNotLoaded, duration: 2.0))
+        XCTAssertEqual(
+            controller.lastOutcome?.message, "Chave de API não carregada nesta execução — áudio descartado (2,0 s)"
+        )
     }
 
-    // MARK: Keychain lookup (never on the main path, never mistaken for a missing key)
+    func testClipsReuseTheExplicitlyLoadedKeyWithoutTouchingTheKeychainAgain() {
+        grantAndLoadKey()
+        XCTAssertEqual(keys.calls, [.read])
+        XCTAssertEqual(settings.keyStatus, .loaded)
 
-    func testKeyIsLookedUpOnTheKeychainQueueBeforeTheQuestion() {
+        recordAndStop()
+        confirmer.answer(true)
+        provider.complete(.success("primeiro"))
+        recordAndStop(seconds: 1.0)
+        provider.complete(.success("segundo"), request: 1)
+
+        XCTAssertEqual(provider.received.map(\.duration), [2.0, 1.0])
+        XCTAssertEqual(controller.lastOutcome, .transcribed("segundo", duration: 1.0))
+        XCTAssertEqual(keys.calls, [.read], "no lookup or read per clip, before or after the question")
+    }
+
+    func testLoadRunsOnTheKeychainQueueAndAClipStoppedMeanwhileDoesNotWaitForIt() {
         consent.grant()
         queue.holds = true
 
+        loadKey()
+        XCTAssertEqual(keys.calls, [], "the main path never touches the keychain")
+        XCTAssertTrue(settings.isWaitingForKeychain)
+        XCTAssertEqual(settings.keyStatus, .notLoaded)
         recordAndStop()
 
-        XCTAssertEqual(keys.calls, [], "the main path never touches the keychain")
-        XCTAssertTrue(confirmer.asked.isEmpty)
-        XCTAssertEqual(controller.phase, .processing)
+        XCTAssertEqual(controller.phase, .idle, "a clip never waits on the keychain")
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionKeyNotLoaded, duration: 2.0))
         queue.drain()
-        XCTAssertEqual(keys.calls, [.contains], "attributes only; the secret is never read by the gate")
-        XCTAssertEqual(confirmer.asked, [2.0])
+        XCTAssertEqual(keys.calls, [.read])
+        XCTAssertFalse(settings.isWaitingForKeychain)
+        XCTAssertEqual(settings.keyStatus, .loaded)
+        recordAndStop(seconds: 1.0)
+        XCTAssertEqual(confirmer.asked, [1.0])
     }
 
-    func testKeychainFailureIsNotReportedAsAMissingKey() {
+    func testLoadThatFindsNoSavedKeyDiscardsAsNotConfigured() throws {
         consent.grant()
-        keys.fail(.contains, status: errSecInteractionNotAllowed)
+        try keys.delete()
 
+        loadKey()
         recordAndStop()
 
+        XCTAssertEqual(settings.keyStatus, .missing)
+        XCTAssertTrue(confirmer.asked.isEmpty)
+        XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
+    }
+
+    func testRefusedLoadIsNotReportedAsAMissingKey() {
+        consent.grant()
+        keys.fail(.read, status: errSecInteractionNotAllowed)
+        var failures: [KeychainError?] = []
+
+        settings.loadKey { failures.append($0) }
+        recordAndStop()
+
+        XCTAssertEqual(failures, [KeychainError(status: errSecInteractionNotAllowed)])
+        XCTAssertEqual(settings.keyStatus, .unavailable(KeychainError(status: errSecInteractionNotAllowed)))
         XCTAssertTrue(confirmer.asked.isEmpty)
         XCTAssertTrue(provider.received.isEmpty)
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionKeychainUnavailable, duration: 2.0))
         XCTAssertEqual(controller.lastOutcome?.message, "Keychain não liberou a chave de API — áudio descartado (2,0 s)")
     }
 
-    func testCancelDuringTheKeyLookupNeverAsks() {
-        consent.grant()
-        queue.holds = true
-        recordAndStop()
-
-        controller.cancel()
-        queue.drain()
-
-        XCTAssertTrue(confirmer.asked.isEmpty)
-        XCTAssertTrue(provider.received.isEmpty)
-        XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 2.0))
-    }
-
     // MARK: First-send confirmation
 
     func testFirstSendIsConfirmedWithClipDurationBeforeAnythingIsSent() {
-        consent.grant()
+        grantAndLoadKey()
 
         recordAndStop()
 
@@ -137,7 +190,7 @@ final class ConsentGateTests: XCTestCase {
     }
 
     func testLaterClipsAreSentWithoutAskingAgain() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
         confirmer.answer(true)
         provider.complete(.success("primeiro"))
@@ -149,7 +202,7 @@ final class ConsentGateTests: XCTestCase {
     }
 
     func testDeclinedFirstSendSendsNothingAndAsksAgainNextTime() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
 
         confirmer.answer(false)
@@ -161,10 +214,11 @@ final class ConsentGateTests: XCTestCase {
 
         recordAndStop(seconds: 1.0)
         XCTAssertEqual(confirmer.asked, [2.0, 1.0])
+        XCTAssertEqual(keys.calls, [.read])
     }
 
     func testRepeatedAnswerSendsOnce() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
 
         confirmer.answer(true)
@@ -174,7 +228,7 @@ final class ConsentGateTests: XCTestCase {
     }
 
     func testSynchronousConfirmationSendsOnce() {
-        consent.grant()
+        grantAndLoadKey()
         confirmer.immediateAnswer = true
 
         recordAndStop()
@@ -185,7 +239,7 @@ final class ConsentGateTests: XCTestCase {
     }
 
     func testProviderAnswerIsReportedOnceAndItsRequestIsNotCancelled() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
         confirmer.answer(true)
 
@@ -200,7 +254,7 @@ final class ConsentGateTests: XCTestCase {
     // MARK: Late answers (the question is withdrawn on time; a later "yes" counts for nothing)
 
     func testCancelWhileConfirmingWithdrawsQuestionAndIgnoresLaterYes() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
 
         controller.cancel()
@@ -210,10 +264,11 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertTrue(provider.received.isEmpty)
         XCTAssertEqual(consent.state, .awaitingFirstSend, "a withdrawn question confirms nothing")
         XCTAssertEqual(controller.lastOutcome, .discarded(.cancelled, duration: 2.0))
+        XCTAssertEqual(keys.calls, [.read])
     }
 
     func testDeadlineWhileConfirmingWithdrawsQuestionAndALateYesConfirmsNothing() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
 
         scheduler.advance(by: 30)
@@ -225,21 +280,8 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionTimedOut, duration: 2.0))
     }
 
-    func testYesThenCancelBeforeTheKeyIsLookedUpAgainSendsAndConfirmsNothing() {
-        consent.grant()
-        recordAndStop()
-        queue.holds = true
-
-        confirmer.answer(true)
-        controller.cancel()
-        queue.drain()
-
-        XCTAssertTrue(provider.received.isEmpty)
-        XCTAssertEqual(consent.state, .awaitingFirstSend, "only a clip handed to the provider confirms the first send")
-    }
-
     func testRevocationWhileConfirmingBlocksTheSend() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
 
         consent.revoke()
@@ -250,19 +292,37 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
     }
 
-    func testKeyRemovedElsewhereWhileConfirmingBlocksTheSend() throws {
-        consent.grant()
+    func testReloadFindingNoKeyWhileConfirmingSendsAndConfirmsNothing() throws {
+        grantAndLoadKey()
         recordAndStop()
+        try keys.delete() // outside the app, e.g. in Keychain Access
 
-        try keys.delete()
+        loadKey()
         confirmer.answer(true)
 
+        XCTAssertEqual(settings.keyStatus, .missing)
         XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(consent.state, .awaitingFirstSend, "only a clip handed to the provider confirms the first send")
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
     }
 
+    func testRefusedReloadWhileConfirmingKeepsTheKeyAlreadyLoaded() {
+        grantAndLoadKey()
+        recordAndStop()
+        keys.fail(.read, status: errSecInteractionNotAllowed) // the keychain was locked again
+        var failures: [KeychainError?] = []
+
+        settings.loadKey { failures.append($0) }
+        confirmer.answer(true)
+
+        XCTAssertEqual(failures, [KeychainError(status: errSecInteractionNotAllowed)])
+        XCTAssertEqual(settings.keyStatus, .loaded, "a failed reload changes nothing in memory")
+        XCTAssertEqual(provider.received.count, 1)
+        XCTAssertEqual(keys.calls, [.read, .read], "each read is an explicit load")
+    }
+
     func testCancelAfterConfirmationCancelsTheProviderRequest() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
         confirmer.answer(true)
 
@@ -274,7 +334,7 @@ final class ConsentGateTests: XCTestCase {
     }
 
     func testCancelInsideProviderCallCancelsTheRequestItStarted() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
         provider.duringTranscribe = { [controller] in controller!.cancel() }
 
@@ -287,7 +347,7 @@ final class ConsentGateTests: XCTestCase {
     // MARK: Settings: revoking consent and removing the key take effect at once
 
     func testRevokingWhileTheQuestionIsOpenWithdrawsItAndDiscardsTheClip() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
 
         settings.revokeConsent()
@@ -300,7 +360,7 @@ final class ConsentGateTests: XCTestCase {
     }
 
     func testRevokingCancelsTheRequestInFlightAndKeepsTheKey() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
         confirmer.answer(true)
         provider.resultOnCancel = .failure(TranscriptionError.cancelled)
@@ -313,22 +373,11 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
         XCTAssertEqual(consent.state, .notGranted)
         XCTAssertNotNil(keys.storedKey, "revoking never deletes the key")
-    }
-
-    func testRevokingDuringTheKeyLookupDiscardsTheClip() {
-        consent.grant()
-        queue.holds = true
-        recordAndStop()
-
-        settings.revokeConsent()
-        queue.drain()
-
-        XCTAssertTrue(confirmer.asked.isEmpty)
-        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
+        XCTAssertEqual(settings.keyStatus, .loaded, "nor forgets it for this run")
     }
 
     func testRevokingWhileRecordingSendsNothingWhenItStops() {
-        consent.grant()
+        grantAndLoadKey()
         controller.start()
         permission.answer(true)
         capture.feed(Synthetic.tone(seconds: 2.0))
@@ -341,8 +390,8 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
     }
 
-    func testFailedRemovalWhileRecordingPreventsAnyUploadForThatClip() {
-        consent.grant()
+    func testFailedRemovalWhileRecordingPreventsAnyUploadAndForgetsTheKey() {
+        grantAndLoadKey()
         consent.confirmFirstSend()
         keys.fail(.delete, status: errSecAuthFailed)
         controller.start()
@@ -356,10 +405,33 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertEqual(consent.state, .notGranted)
         XCTAssertTrue(provider.received.isEmpty)
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
+        XCTAssertEqual(settings.keyStatus, .notLoaded, "removal forgets this run's key even if the delete fails")
+
+        consent.grant()
+        consent.confirmFirstSend()
+        recordAndStop(seconds: 1.0)
+        XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionKeyNotLoaded, duration: 1.0))
+    }
+
+    func testFailedRemovalStillCancelsTheRequestInFlight() {
+        grantAndLoadKey()
+        consent.confirmFirstSend()
+        keys.fail(.delete, status: errSecAuthFailed)
+        recordAndStop()
+        XCTAssertEqual(provider.received.count, 1)
+
+        settings.removeKey { XCTAssertEqual($0, KeychainError(status: errSecAuthFailed)) }
+        provider.complete(.success("tarde demais"))
+
+        XCTAssertEqual(provider.cancelled, [0])
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
+        XCTAssertEqual(settings.keyStatus, .notLoaded)
+        XCTAssertEqual(consent.state, .notGranted)
     }
 
     func testRemovingTheKeyCancelsTheRequestInFlightAndRevokesConsent() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
         confirmer.answer(true)
 
@@ -374,7 +446,7 @@ final class ConsentGateTests: XCTestCase {
     }
 
     func testRemovingTheKeyWhileTheQuestionIsOpenWithdrawsIt() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
 
         settings.removeKey { XCTAssertNil($0) }
@@ -386,21 +458,171 @@ final class ConsentGateTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
     }
 
-    func testClipStoppedRightAfterRemovalDoesNotWaitForKeychain() {
+    func testRemovalForgetsTheKeyBeforeTheKeychainAnswers() {
+        grantAndLoadKey()
+        queue.holds = true
+
+        settings.removeKey { XCTAssertNil($0) }
+        XCTAssertEqual(settings.keyStatus, .notLoaded)
         consent.grant()
+        consent.confirmFirstSend()
+        recordAndStop()
+
+        XCTAssertEqual(keys.calls, [.read], "the delete is still waiting on the queue")
+        XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionKeyNotLoaded, duration: 2.0))
+        queue.drain()
+        XCTAssertEqual(keys.calls, [.read, .delete])
+        XCTAssertEqual(settings.keyStatus, .missing)
+    }
+
+    func testClipStoppedRightAfterRemovalDoesNotWaitForKeychain() {
+        grantAndLoadKey()
         queue.holds = true
 
         settings.removeKey { XCTAssertNil($0) }
         recordAndStop()
-        queue.drain()
 
-        XCTAssertEqual(keys.calls, [.delete, .contains], "the clip must not look up a key after consent is revoked")
+        XCTAssertEqual(controller.phase, .idle)
         XCTAssertTrue(confirmer.asked.isEmpty)
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
+        queue.drain()
+        XCTAssertEqual(keys.calls, [.read, .delete], "the clip itself never touches the keychain")
+    }
+
+    // MARK: Settings: a load or save asked before a removal never puts the key back
+
+    func testRemovalFromPendingSaveNotificationDoesNotRecreateTheItem() {
+        queue.holds = true
+        settings.onChange = { [unowned self] in
+            settings.onChange = nil
+            settings.removeKey { XCTAssertNil($0) }
+        }
+
+        settings.saveKey(OpenAIAPIKey("synthetic-replacement-key")!) { _ in }
+        queue.drain()
+
+        XCTAssertEqual(keys.calls, [.save, .delete])
+        XCTAssertNil(keys.storedKey, "a stale save must not recreate the deleted item")
+        XCTAssertEqual(settings.keyStatus, .missing)
+    }
+
+    func testSaveFromRefusedClipRunsAfterTheRemovalItObserved() {
+        grantAndLoadKey()
+        recordAndStop()
+        XCTAssertEqual(controller.phase, .processing)
+        queue.holds = true
+        let replacement = OpenAIAPIKey("synthetic-replacement-key")!
+        controller.onChange = { [unowned self] in
+            guard controller.phase == .idle else { return }
+            controller.onChange = nil
+            settings.saveKey(replacement) { XCTAssertNil($0) }
+        }
+
+        settings.removeKey { XCTAssertNil($0) }
+        XCTAssertEqual(consent.state, .notGranted)
+        XCTAssertTrue(provider.received.isEmpty)
+        queue.drain()
+
+        XCTAssertEqual(keys.calls, [.read, .delete, .save])
+        XCTAssertTrue(keys.storedKey?.value == replacement.value, "the newest explicit save must win")
+        XCTAssertEqual(settings.keyStatus, .loaded)
+    }
+
+    func testLoadAskedBeforeARemovalNeverPutsTheKeyBack() {
+        consent.grant()
+        queue.holds = true
+        var loads: [KeychainError?] = []
+
+        settings.loadKey { loads.append($0) }
+        settings.removeKey { XCTAssertNil($0) }
+        queue.drain()
+
+        XCTAssertEqual(keys.calls, [.read, .delete])
+        XCTAssertEqual(settings.keyStatus, .missing)
+        XCTAssertEqual(loads, [nil], "an overtaken load reports nothing")
+        consent.grant()
+        consent.confirmFirstSend()
+        recordAndStop()
+        XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
+    }
+
+    func testSaveAskedBeforeARemovalNeverPutsTheKeyBack() {
+        queue.holds = true
+
+        settings.saveKey(OpenAIAPIKey("another-placeholder-key")!) { XCTAssertNil($0) }
+        settings.removeKey { XCTAssertNil($0) }
+        queue.drain()
+
+        XCTAssertEqual(keys.calls, [.save, .delete])
+        XCTAssertNil(keys.storedKey)
+        XCTAssertEqual(settings.keyStatus, .missing)
+        consent.grant()
+        consent.confirmFirstSend()
+        recordAndStop()
+        XCTAssertTrue(provider.received.isEmpty)
+    }
+
+    func testLoadAskedBeforeAFailedRemovalStillDoesNotRestoreTheKey() {
+        keys.fail(.delete, status: errSecAuthFailed)
+        queue.holds = true
+
+        loadKey()
+        settings.removeKey { XCTAssertEqual($0, KeychainError(status: errSecAuthFailed)) }
+        queue.drain()
+
+        XCTAssertNotNil(keys.storedKey)
+        XCTAssertEqual(settings.keyStatus, .notLoaded)
+        consent.grant()
+        consent.confirmFirstSend()
+        recordAndStop()
+        XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionKeyNotLoaded, duration: 2.0))
+    }
+
+    func testOvertakenFailuresAreNotReportedAfterARemoval() {
+        keys.fail(.read, .save, status: errSecInteractionNotAllowed)
+        queue.holds = true
+        var failures: [KeychainError?] = []
+
+        settings.loadKey { failures.append($0) }
+        settings.saveKey(OpenAIAPIKey("another-placeholder-key")!) { failures.append($0) }
+        settings.removeKey { failures.append($0) }
+        queue.drain()
+
+        XCTAssertEqual(failures, [nil, nil, nil], "the menu is not told about operations the removal overtook")
+        XCTAssertEqual(settings.keyStatus, .missing)
+    }
+
+    func testReloadQueuedWhileConfirmingIsOvertakenByARemoval() {
+        grantAndLoadKey()
+        recordAndStop()
+        queue.holds = true
+
+        loadKey()
+        settings.removeKey { XCTAssertNil($0) }
+        confirmer.answer(true)
+        queue.drain()
+
+        XCTAssertEqual(confirmer.withdrawn, [0])
+        XCTAssertTrue(provider.received.isEmpty)
+        XCTAssertEqual(settings.keyStatus, .missing)
+        XCTAssertEqual(keys.calls, [.read, .read, .delete])
+    }
+
+    func testLoadAskedAfterARemovalIsANewExplicitAction() {
+        keys.fail(.delete, status: errSecAuthFailed)
+        settings.removeKey { XCTAssertEqual($0, KeychainError(status: errSecAuthFailed)) }
+
+        loadKey()
+
+        XCTAssertEqual(settings.keyStatus, .loaded, "the item the delete could not remove is loaded on request")
+        XCTAssertEqual(consent.state, .notGranted, "but sending needs consent again")
     }
 
     func testRevocationStopsLaterSendsAndRegrantAsksAgain() {
-        consent.grant()
+        grantAndLoadKey()
         recordAndStop()
         confirmer.answer(true)
         provider.complete(.success("enviado"))
@@ -419,53 +641,68 @@ final class ConsentGateTests: XCTestCase {
 
     // MARK: Settings: key status
 
-    func testKeyStatusIsUnknownUntilTheLookupAnswersOffTheMainPath() {
-        queue.holds = true
+    func testKeyStatusStartsNotLoadedWithoutTouchingTheKeychain() {
+        XCTAssertEqual(settings.keyStatus, .notLoaded)
+        XCTAssertFalse(settings.isWaitingForKeychain)
+        settings.grantConsent()
+        settings.revokeConsent()
 
-        settings.refreshKeyStatus()
-
-        XCTAssertEqual(settings.keyStatus, .unknown)
         XCTAssertEqual(keys.calls, [])
-        queue.drain()
-        XCTAssertEqual(settings.keyStatus, .stored)
     }
 
     func testKeyStatusTellsAMissingKeyFromAKeychainFailure() throws {
-        var changes = 0
-        settings.onChange = { changes += 1 }
+        var observed: [APIKeyStatus] = []
+        settings.onChange = { observed.append(self.settings.keyStatus) }
 
         try keys.delete()
-        settings.refreshKeyStatus()
+        loadKey()
         XCTAssertEqual(settings.keyStatus, .missing)
+        XCTAssertEqual(observed.last, .missing, "the menu is told about the answer")
 
-        keys.fail(.contains, status: errSecInteractionNotAllowed)
-        settings.refreshKeyStatus()
+        keys.fail(.read, status: errSecInteractionNotAllowed)
+        settings.loadKey { XCTAssertEqual($0, KeychainError(status: errSecInteractionNotAllowed)) }
         XCTAssertEqual(settings.keyStatus, .unavailable(KeychainError(status: errSecInteractionNotAllowed)))
-        XCTAssertEqual(changes, 2)
+        XCTAssertEqual(observed.last, .unavailable(KeychainError(status: errSecInteractionNotAllowed)))
     }
 
-    func testFailedSaveAndRemovalReportOnlyTheStatusAndRefreshIt() {
+    func testWaitingForTheKeychainIsPublished() {
+        var waiting: [Bool] = []
+        settings.onChange = { waiting.append(self.settings.isWaitingForKeychain) }
+        queue.holds = true
+
+        loadKey()
+        queue.drain()
+
+        XCTAssertEqual(waiting, [true, false])
+    }
+
+    func testFailedSaveAndRemovalReportOnlyTheStatus() {
+        loadKey()
         keys.fail(.save, .delete, status: errSecAuthFailed)
         var failures: [KeychainError?] = []
 
         settings.saveKey(OpenAIAPIKey("another-placeholder-key")!) { failures.append($0) }
+        XCTAssertEqual(settings.keyStatus, .loaded, "a failed save leaves the loaded key in place")
         settings.removeKey { failures.append($0) }
 
         XCTAssertEqual(failures, [KeychainError(status: errSecAuthFailed), KeychainError(status: errSecAuthFailed)])
-        XCTAssertEqual(settings.keyStatus, .stored, "the old key is still there")
-        XCTAssertEqual(keys.storedKey?.value, "placeholder-key-for-tests")
+        XCTAssertEqual(settings.keyStatus, .notLoaded)
+        XCTAssertEqual(keys.storedKey?.value, "placeholder-key-for-tests", "the old key is still in the keychain")
     }
 
-    func testSavedKeyIsReportedStoredWithoutTouchingConsent() {
+    func testSavedKeyIsKeptForThisRunWithoutReadingItBackOrTouchingConsent() {
         consent.grant()
         keys.fail(.read, status: errSecAuthFailed)
 
         settings.saveKey(OpenAIAPIKey("another-placeholder-key")!) { XCTAssertNil($0) }
 
-        XCTAssertEqual(settings.keyStatus, .stored)
+        XCTAssertEqual(settings.keyStatus, .loaded)
         XCTAssertEqual(keys.storedKey?.value, "another-placeholder-key")
         XCTAssertEqual(consent.state, .awaitingFirstSend)
-        XCTAssertFalse(keys.calls.contains(.read), "settings never read the secret")
+        recordAndStop()
+        confirmer.answer(true)
+        XCTAssertEqual(provider.received.count, 1)
+        XCTAssertEqual(keys.calls, [.save], "settings never read the secret back")
     }
 }
 
@@ -536,7 +773,7 @@ final class CloudPipelineTests: XCTestCase {
     private var scheduler: FakeScheduler!
 
     private func process(
-        _ cloud: CloudTranscription
+        _ cloud: CloudTranscription, seconds: Double = 2.0
     ) -> (CaptureController, XCTestExpectation) {
         permission = FakePermission()
         capture = FakeCapture()
@@ -546,7 +783,7 @@ final class CloudPipelineTests: XCTestCase {
         )
         controller.start()
         permission.answer(true)
-        capture.feed(Synthetic.tone(seconds: 2.0))
+        capture.feed(Synthetic.tone(seconds: seconds))
         let ended = expectation(description: "session ended")
         controller.onChange = { if controller.phase == .idle { ended.fulfill() } }
         controller.stop()
@@ -555,7 +792,7 @@ final class CloudPipelineTests: XCTestCase {
 
     private func cloud(
         _ transport: FakeTransport,
-        _ keys: FakeKeyStore,
+        _ keys: any APIKeyStore,
         _ consent: CloudConsent,
         _ confirmer: FakeConfirmer = FakeConfirmer(),
         queue: KeychainQueue = ManualKeychainQueue()
@@ -564,6 +801,192 @@ final class CloudPipelineTests: XCTestCase {
             keys: keys, consent: consent, confirmFirstSend: confirmer.confirmation, queue: queue, transport: transport
         )
     }
+
+    private func activeConsent() -> CloudConsent {
+        let consent = CloudConsent(storage: MemoryConsentStorage())
+        consent.grant()
+        consent.confirmFirstSend()
+        return consent
+    }
+
+    /// The app's own item, stored in a `SecItem` double; nothing touches the user's keychain.
+    private func appKeychainItem() -> (FakeKeychain, KeychainAPIKeyStore) {
+        let keychain = FakeKeychain()
+        keychain.store([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: KeychainAPIKeyStore.defaultService,
+            kSecAttrAccount as String: "default",
+            kSecValueData as String: Data("placeholder-key-for-tests".utf8),
+        ])
+        let store = KeychainAPIKeyStore(
+            service: KeychainAPIKeyStore.defaultService, account: "default", keychain: keychain.functions
+        )
+        return (keychain, store)
+    }
+
+    private func hangingTransport(_ gate: Gate) -> FakeTransport {
+        FakeTransport { _ in
+            await gate.wait()
+            return HTTPResponse(statusCode: 200, body: Data(#"{"text":"atrasado"}"#.utf8))
+        }
+    }
+
+    // MARK: The real Keychain store over a SecItem double: count every operation
+
+    func testAppCompositionReadsOnlyTheAppItemOnceOnAnExplicitLoadAndNeverPerClip() async throws {
+        let (keychain, store) = appKeychainItem()
+        let transport = FakeTransport(status: 200, body: #"{"text":"Ditado sintético."}"#)
+        let pipeline = cloud(transport, store, activeConsent())
+        XCTAssertTrue(keychain.calls.isEmpty, "composing the cloud path touches nothing")
+
+        let (notLoaded, discarded) = process(pipeline)
+        await fulfillment(of: [discarded], timeout: 5)
+        XCTAssertEqual(notLoaded.lastOutcome, .discarded(.transcriptionKeyNotLoaded, duration: 2.0))
+        XCTAssertTrue(keychain.calls.isEmpty, "recording and stopping never touch the keychain")
+        XCTAssertTrue(transport.requests.isEmpty)
+
+        pipeline.settings.loadKey { XCTAssertNil($0) }
+        XCTAssertEqual(keychain.calls.map(\.operation), ["copy"])
+        let query = try XCTUnwrap(keychain.calls.first?.query)
+        XCTAssertEqual(query[kSecClass as String] as? String, kSecClassGenericPassword as String)
+        XCTAssertEqual(query[kSecAttrService as String] as? String, KeychainAPIKeyStore.defaultService)
+        XCTAssertEqual(query[kSecAttrAccount as String] as? String, "default")
+        XCTAssertEqual(query[kSecMatchLimit as String] as? String, kSecMatchLimitOne as String)
+        XCTAssertEqual(query[kSecReturnData as String] as? Bool, true)
+        XCTAssertEqual(pipeline.settings.keyStatus, .loaded)
+
+        for seconds in [2.0, 1.0] {
+            let (controller, ended) = process(pipeline, seconds: seconds)
+            await fulfillment(of: [ended], timeout: 5)
+            XCTAssertEqual(controller.lastOutcome, .transcribed("Ditado sintético.", duration: seconds))
+        }
+
+        XCTAssertEqual(keychain.calls.count, 1, "two clips sent, no further keychain call")
+        XCTAssertEqual(transport.requests.count, 2)
+        for request in transport.requests {
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer placeholder-key-for-tests")
+        }
+    }
+
+    func testDeniedThenAllowedLoadWithTheRealStoreCountsOneReadPerExplicitLoad() async {
+        let (keychain, store) = appKeychainItem()
+        let transport = FakeTransport(status: 200, body: #"{"text":"Ditado sintético."}"#)
+        let pipeline = cloud(transport, store, activeConsent())
+        keychain.forcedStatus = errSecAuthFailed // the user denied the system's access dialog
+
+        var failures: [KeychainError?] = []
+        pipeline.settings.loadKey { failures.append($0) }
+        let (denied, discarded) = process(pipeline)
+        await fulfillment(of: [discarded], timeout: 5)
+
+        XCTAssertEqual(failures, [KeychainError(status: errSecAuthFailed)])
+        XCTAssertEqual(pipeline.settings.keyStatus, .unavailable(KeychainError(status: errSecAuthFailed)))
+        XCTAssertEqual(denied.lastOutcome, .discarded(.transcriptionKeychainUnavailable, duration: 2.0))
+        XCTAssertEqual(keychain.calls.count, 1, "a denied load is not retried by the clip")
+        XCTAssertTrue(transport.requests.isEmpty)
+
+        keychain.forcedStatus = nil
+        pipeline.settings.loadKey { XCTAssertNil($0) }
+        let (allowed, ended) = process(pipeline)
+        await fulfillment(of: [ended], timeout: 5)
+
+        XCTAssertEqual(allowed.lastOutcome, .transcribed("Ditado sintético.", duration: 2.0))
+        XCTAssertEqual(keychain.calls.map(\.operation), ["copy", "copy"])
+        XCTAssertEqual(transport.requests.count, 1)
+    }
+
+    func testDeclinedOrCancelledFirstSendWithTheRealStoreSendsNothingAndReadsNothingMore() async {
+        let (keychain, store) = appKeychainItem()
+        let transport = FakeTransport(status: 200, body: #"{"text":"nunca"}"#)
+        let consent = CloudConsent(storage: MemoryConsentStorage())
+        consent.grant()
+        let confirmer = FakeConfirmer()
+        let pipeline = cloud(transport, store, consent, confirmer)
+        pipeline.settings.loadKey { XCTAssertNil($0) }
+
+        let (declined, first) = process(pipeline)
+        confirmer.answer(false, question: 0)
+        await fulfillment(of: [first], timeout: 5)
+        let (cancelled, second) = process(pipeline)
+        cancelled.cancel()
+        confirmer.answer(true, question: 1)
+        await fulfillment(of: [second], timeout: 5)
+
+        XCTAssertEqual(declined.lastOutcome, .discarded(.transcriptionDeclined, duration: 2.0))
+        XCTAssertEqual(cancelled.lastOutcome, .discarded(.cancelled, duration: 2.0))
+        XCTAssertEqual(consent.state, .awaitingFirstSend)
+        XCTAssertTrue(transport.requests.isEmpty)
+        XCTAssertEqual(keychain.calls.count, 1)
+    }
+
+    func testRemovalWithTheRealStoreCancelsTheRequestAndALateAnswerIsIgnored() async {
+        let (keychain, store) = appKeychainItem()
+        let gate = Gate()
+        let transport = hangingTransport(gate)
+        let consent = activeConsent()
+        let pipeline = cloud(transport, store, consent)
+        pipeline.settings.loadKey { XCTAssertNil($0) }
+        let (controller, ended) = process(pipeline)
+        await fulfillment(of: [transport.sent], timeout: 5)
+
+        pipeline.settings.removeKey { XCTAssertNil($0) }
+        await fulfillment(of: [ended], timeout: 1)
+        let changed = expectation(description: "no change after removal")
+        changed.isInverted = true
+        controller.onChange = { changed.fulfill() }
+        await gate.open()
+        await fulfillment(of: [changed], timeout: 0.5)
+
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
+        XCTAssertEqual(keychain.calls.map(\.operation), ["copy", "delete"])
+        XCTAssertTrue(keychain.storedItems.isEmpty)
+        XCTAssertEqual(pipeline.settings.keyStatus, .missing)
+
+        consent.grant()
+        consent.confirmFirstSend()
+        let (after, discarded) = process(pipeline)
+        await fulfillment(of: [discarded], timeout: 5)
+        XCTAssertEqual(after.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertEqual(keychain.calls.count, 2)
+    }
+
+    func testLoadOvertakenByARemovalWithTheRealStoreNeverRestoresTheKey() async {
+        let (keychain, store) = appKeychainItem()
+        let transport = FakeTransport(status: 200, body: #"{"text":"nunca"}"#)
+        let consent = activeConsent()
+        let queue = ManualKeychainQueue()
+        queue.holds = true
+        let pipeline = cloud(transport, store, consent, queue: queue)
+
+        pipeline.settings.loadKey { XCTAssertNil($0) }
+        pipeline.settings.removeKey { XCTAssertNil($0) }
+        queue.drain()
+        consent.grant()
+        consent.confirmFirstSend()
+        let (controller, ended) = process(pipeline)
+        await fulfillment(of: [ended], timeout: 5)
+
+        XCTAssertEqual(keychain.calls.map(\.operation), ["copy", "delete"])
+        XCTAssertEqual(pipeline.settings.keyStatus, .missing)
+        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionUnavailable, duration: 2.0))
+        XCTAssertTrue(transport.requests.isEmpty)
+    }
+
+    func testTheLoadedKeyNeverShowsInDescriptionsOrDumps() {
+        let (_, store) = appKeychainItem()
+        let pipeline = cloud(FakeTransport(status: 200, body: "{}"), store, activeConsent())
+        pipeline.settings.loadKey { XCTAssertNil($0) }
+        XCTAssertEqual(pipeline.settings.keyStatus, .loaded)
+
+        var rendered = String(describing: pipeline.settings.keyStatus) + String(reflecting: pipeline.settings)
+        dump(pipeline.settings, to: &rendered)
+        dump(pipeline.transcriber, to: &rendered)
+
+        XCTAssertFalse(rendered.contains("placeholder-key-for-tests"))
+    }
+
+    // MARK: Fake key store
 
     func testAppPipelineSendsNothingWithoutConsent() async {
         let transport = FakeTransport(status: 200, body: #"{"text":"nunca"}"#)
@@ -577,30 +1000,16 @@ final class CloudPipelineTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
     }
 
-    func testAppPipelineDeclinedFirstSendSendsNothing() async {
-        let transport = FakeTransport(status: 200, body: #"{"text":"nunca"}"#)
-        let keys = FakeKeyStore(placeholderKey)
-        let consent = CloudConsent(storage: MemoryConsentStorage())
-        consent.grant()
-        let confirmer = FakeConfirmer()
-
-        let (controller, ended) = process(cloud(transport, keys, consent, confirmer))
-        confirmer.answer(false)
-        await fulfillment(of: [ended], timeout: 5)
-
-        XCTAssertTrue(transport.requests.isEmpty)
-        XCTAssertEqual(keys.reads, 0)
-        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionDeclined, duration: 2.0))
-    }
-
-    func testAppPipelineSendsOnceAfterConsentAndConfirmationWithStoredKey() async throws {
+    func testAppPipelineSendsOnceAfterConsentConfirmationAndAnExplicitLoad() async throws {
         let transport = FakeTransport(status: 200, body: #"{"text":"Ditado sintético."}"#)
         let keys = FakeKeyStore(placeholderKey)
         let consent = CloudConsent(storage: MemoryConsentStorage())
         consent.grant()
         let confirmer = FakeConfirmer()
+        let pipeline = cloud(transport, keys, consent, confirmer)
+        pipeline.settings.loadKey { XCTAssertNil($0) }
 
-        let (controller, ended) = process(cloud(transport, keys, consent, confirmer))
+        let (controller, ended) = process(pipeline)
         XCTAssertTrue(transport.requests.isEmpty)
         confirmer.answer(true)
         await fulfillment(of: [ended], timeout: 5)
@@ -611,33 +1020,28 @@ final class CloudPipelineTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer placeholder-key-for-tests")
         XCTAssertEqual(controller.lastOutcome, .transcribed("Ditado sintético.", duration: 2.0))
         XCTAssertEqual(consent.state, .active)
+        XCTAssertEqual(keys.calls, [.read])
     }
 
-    func testUnreadableKeyIsReportedAsKeychainFailureAndNothingIsSent() async {
-        let transport = FakeTransport(status: 200, body: #"{"text":"nunca"}"#)
-        let keys = FakeKeyStore(placeholderKey)
-        keys.fail(.read, status: errSecAuthFailed)
-        let consent = CloudConsent(storage: MemoryConsentStorage())
-        consent.grant()
-        consent.confirmFirstSend()
+    func testSavedKeyIsTheOneSentWithoutReadingItBack() async throws {
+        let transport = FakeTransport(status: 200, body: #"{"text":"Ditado sintético."}"#)
+        let keys = FakeKeyStore()
+        let pipeline = cloud(transport, keys, activeConsent())
 
-        let (controller, ended) = process(cloud(transport, keys, consent))
+        pipeline.settings.saveKey(OpenAIAPIKey("another-placeholder-key")!) { XCTAssertNil($0) }
+        let (_, ended) = process(pipeline)
         await fulfillment(of: [ended], timeout: 5)
 
-        XCTAssertTrue(transport.requests.isEmpty)
-        XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionKeychainUnavailable, duration: 2.0))
+        let request = try XCTUnwrap(transport.requests.first)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer another-placeholder-key")
+        XCTAssertEqual(keys.calls, [.save])
     }
 
     func testRevokingThroughTheAppSettingsCancelsTheRequestInFlight() async {
         let gate = Gate()
-        let transport = FakeTransport { _ in
-            await gate.wait()
-            return HTTPResponse(statusCode: 200, body: Data(#"{"text":"atrasado"}"#.utf8))
-        }
-        let consent = CloudConsent(storage: MemoryConsentStorage())
-        consent.grant()
-        consent.confirmFirstSend()
-        let pipeline = cloud(transport, FakeKeyStore(placeholderKey), consent)
+        let transport = hangingTransport(gate)
+        let pipeline = cloud(transport, FakeKeyStore(placeholderKey), activeConsent())
+        pipeline.settings.loadKey { XCTAssertNil($0) }
         let (controller, ended) = process(pipeline)
         await fulfillment(of: [transport.sent], timeout: 5)
 
@@ -652,50 +1056,52 @@ final class CloudPipelineTests: XCTestCase {
         XCTAssertEqual(controller.lastOutcome, .discarded(.transcriptionNotAuthorized, duration: 2.0))
     }
 
-    func testTheSecretIsReadThroughTheKeychainQueue() async throws {
+    func testAnExplicitLoadWaitsOnTheKeychainQueueButClipsNeverDo() async {
         let transport = FakeTransport(status: 200, body: #"{"text":"Ditado sintético."}"#)
         let keys = FakeKeyStore(placeholderKey)
-        let consent = CloudConsent(storage: MemoryConsentStorage())
-        consent.grant()
-        consent.confirmFirstSend()
         let queue = ManualKeychainQueue()
         queue.holds = true
+        let pipeline = cloud(transport, keys, activeConsent(), queue: queue)
 
-        let (controller, ended) = process(cloud(transport, keys, consent, queue: queue))
-        queue.drain()
-        for _ in 0..<200 where queue.pendingCount == 0 { try await Task.sleep(nanoseconds: 10_000_000) }
+        pipeline.settings.loadKey { XCTAssertNil($0) }
+        XCTAssertEqual(queue.pendingCount, 1)
+        let (waiting, discarded) = process(pipeline)
+        await fulfillment(of: [discarded], timeout: 5)
+        XCTAssertEqual(waiting.lastOutcome, .discarded(.transcriptionKeyNotLoaded, duration: 2.0))
+        XCTAssertEqual(queue.pendingCount, 1, "the clip added nothing to the keychain queue")
 
-        XCTAssertEqual(queue.pendingCount, 1, "the provider waits for its read on the queue")
-        XCTAssertEqual(keys.calls, [.contains])
-        XCTAssertTrue(transport.requests.isEmpty)
         queue.drain()
+        let (controller, ended) = process(pipeline)
         await fulfillment(of: [ended], timeout: 5)
-        XCTAssertEqual(keys.calls, [.contains, .read])
+
+        XCTAssertEqual(queue.pendingCount, 0)
+        XCTAssertEqual(keys.calls, [.read])
         XCTAssertEqual(controller.lastOutcome, .transcribed("Ditado sintético.", duration: 2.0))
     }
 
-    func testDefaultCompositionTouchesTheKeychainOnlyOffTheMainThread() async {
+    func testDefaultCompositionTouchesTheKeychainOnlyOffTheMainThreadAndOnlyOnce() async {
         let transport = FakeTransport(status: 200, body: #"{"text":"Ditado sintético."}"#)
         let keys = FakeKeyStore(placeholderKey)
-        let consent = CloudConsent(storage: MemoryConsentStorage())
-        consent.grant()
-        consent.confirmFirstSend()
         let cloud = CloudTranscription.openAI(
-            keys: keys, consent: consent, confirmFirstSend: FakeConfirmer().confirmation, transport: transport
+            keys: keys, consent: activeConsent(), confirmFirstSend: FakeConfirmer().confirmation, transport: transport
         )
 
-        let (controller, ended) = process(cloud)
-        XCTAssertEqual(controller.phase, .processing)
-        await fulfillment(of: [ended], timeout: 5)
-        let refreshed = expectation(description: "key status published")
-        cloud.settings.onChange = { refreshed.fulfill() }
-        cloud.settings.refreshKeyStatus()
-        await fulfillment(of: [refreshed], timeout: 5)
+        let loaded = expectation(description: "key loaded")
+        cloud.settings.loadKey { failure in
+            XCTAssertNil(failure)
+            loaded.fulfill()
+        }
+        await fulfillment(of: [loaded], timeout: 5)
+        for _ in 0..<2 {
+            let (controller, ended) = process(cloud)
+            XCTAssertEqual(controller.phase, .processing)
+            await fulfillment(of: [ended], timeout: 5)
+            XCTAssertEqual(controller.lastOutcome, .transcribed("Ditado sintético.", duration: 2.0))
+        }
 
-        XCTAssertEqual(controller.lastOutcome, .transcribed("Ditado sintético.", duration: 2.0))
-        XCTAssertEqual(keys.calls, [.contains, .read, .contains])
+        XCTAssertEqual(keys.calls, [.read])
         XCTAssertEqual(keys.callsOnMainThread, 0, "keychain calls may wait on a system dialog")
-        XCTAssertEqual(cloud.settings.keyStatus, .stored)
+        XCTAssertEqual(transport.requests.count, 2)
     }
 }
 

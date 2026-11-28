@@ -54,7 +54,6 @@ final class KeychainAPIKeyStoreTests: XCTestCase {
 
         try store.save(placeholderKey)
         _ = try store.read()
-        _ = try store.contains()
         try store.delete()
 
         XCTAssertFalse(keychain.calls.isEmpty)
@@ -63,26 +62,19 @@ final class KeychainAPIKeyStoreTests: XCTestCase {
         }
     }
 
-    func testContainsNeverRequestsTheSecret() throws {
-        let keychain = FakeKeychain()
-        let store = makeStore(keychain)
-        XCTAssertFalse(try store.contains())
-
-        try store.save(placeholderKey)
-
-        XCTAssertTrue(try store.contains())
-        for call in keychain.calls where call.operation == "copy" {
-            XCTAssertNil(call.query[kSecReturnData as String])
-        }
-    }
-
-    func testReadAsksForOneItemsData() throws {
+    func testReadAsksForTheDataOfTheAppsOwnItemOnly() throws {
         let keychain = FakeKeychain()
         _ = try makeStore(keychain).read()
 
+        XCTAssertEqual(keychain.calls.count, 1)
         let query = try XCTUnwrap(keychain.calls.first?.query)
         XCTAssertEqual(query[kSecReturnData as String] as? Bool, true)
         XCTAssertEqual(string(query, kSecMatchLimit), kSecMatchLimitOne as String)
+        XCTAssertEqual(string(query, kSecClass), kSecClassGenericPassword as String)
+        XCTAssertEqual(string(query, kSecAttrService), service)
+        XCTAssertEqual(string(query, kSecAttrAccount), account)
+        XCTAssertNil(query[kSecReturnAttributes as String])
+        XCTAssertNil(query[kSecReturnRef as String])
     }
 
     func testMissingKeyReadsAsNilAndDeleteIsIdempotent() throws {
@@ -95,7 +87,6 @@ final class KeychainAPIKeyStoreTests: XCTestCase {
         try store.delete()
 
         XCTAssertNil(try store.read())
-        XCTAssertFalse(try store.contains())
     }
 
     func testCorruptedItemIsAnErrorNotAKey() throws {
@@ -118,7 +109,7 @@ final class KeychainAPIKeyStoreTests: XCTestCase {
         try store.save(placeholderKey)
         keychain.forcedStatus = errSecInteractionNotAllowed
 
-        for operation in [{ _ = try store.read() }, { _ = try store.contains() }, { try store.save(placeholderKey) }, { try store.delete() }] {
+        for operation in [{ _ = try store.read() }, { try store.save(placeholderKey) }, { try store.delete() }] {
             XCTAssertThrowsError(try operation()) { error in
                 XCTAssertEqual(error as? KeychainError, KeychainError(status: errSecInteractionNotAllowed))
                 let rendered = [String(describing: error), String(reflecting: error), error.localizedDescription].joined()
